@@ -129,6 +129,9 @@ public:
         // Load configuration
         loadConfig();
 
+        // Setup ZMQ socket options
+        zmq_socket.set(zmq::sockopt::sndhwm, 10);
+
         // Setup signal handlers
         signal(SIGINT, [](int sig) { g_running = 0; });
         signal(SIGTERM, [](int sig) { g_running = 0; });
@@ -240,7 +243,8 @@ public:
 
                 // Send frame data
                 size_t frame_size = frame.total() * frame.elemSize();
-                zmq::message_t frame_msg(frame.data, frame_size);
+                zmq::message_t frame_msg(frame_size);
+                std::memcpy(frame_msg.data(), frame.data, frame_size);
                 zmq_socket.send(frame_msg, zmq::send_flags::none);
 
                 frames_published++;

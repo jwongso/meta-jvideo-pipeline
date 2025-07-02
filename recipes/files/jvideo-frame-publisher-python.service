@@ -14,8 +14,56 @@ StandardOutput=journal
 StandardError=journal
 WorkingDirectory=/opt/jvideo
 
+# Memory Management (Python typically uses more memory than C++)
+MemoryLimit=384M
+MemorySwapMax=0
+MemoryAccounting=yes
+
+# Process Management
+TasksMax=15
+LimitNOFILE=1024
+LimitNPROC=8
+
+# Priority and Resource Control
+Nice=5
+OOMScoreAdjust=100
+CPUQuota=75%
+
+# Python-specific Environment Variables
 Environment="PYTHONUNBUFFERED=1"
 Environment="JVIDEO_SERVICE_IMPL=python"
+
+# Python Memory Optimizations
+Environment="PYTHONHASHSEED=0"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="PYTHONOPTIMIZE=2"
+Environment="MALLOC_TRIM_THRESHOLD_=10000"
+Environment="MALLOC_MMAP_MAX_=2"
+
+# Threading Control for Python
+Environment="OMP_NUM_THREADS=1"
+Environment="OPENBLAS_NUM_THREADS=1"
+Environment="MKL_NUM_THREADS=1"
+Environment="NUMEXPR_NUM_THREADS=1"
+Environment="OPENCV_FOR_THREADS_NUM=1"
+Environment="ZMQ_IO_THREADS=1"
+
+# OpenCV optimizations for embedded systems
+Environment="OPENCV_FFMPEG_CAPTURE_OPTIONS=threads;1"
+Environment="OPENCV_LOG_LEVEL=ERROR"
+
+# Python GIL and garbage collection tuning
+Environment="PYTHONGC=1"
+
+# Security (optional but recommended for production)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/jvideo /tmp
+
+# Watchdog (optional - restart if service becomes unresponsive)
+WatchdogSec=45
+NotifyAccess=all
 
 [Install]
 WantedBy=multi-user.target

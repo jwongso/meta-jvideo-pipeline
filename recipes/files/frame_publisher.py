@@ -1,422 +1,191 @@
 #!/usr/bin/env python3
-"""Frame Publisher Service - Configurable camera or synthetic video source"""
+"""
+Memory optimization examples for Python frame publisher
+"""
 
+import gc
 import sys
-import time
+import psutil
 import os
-import json
-import signal
-sys.path.append('/opt/jvideo/services')
-
-import cv2
+from typing import Optional
 import numpy as np
+import cv2
 import zmq
-from enum import Enum
-from service_base import ServiceBase
+import json
+import time
+import redis
+from contextlib import contextmanager
 
-class SourceType(Enum):
-    CAMERA = "camera"
-    SYNTHETIC = "synthetic"
-
-class FramePublisher(ServiceBase):
+class MemoryOptimizedFramePublisher:
     def __init__(self):
-        super().__init__('frame-publisher')
-
-        # Load configuration
-        self.config = self._load_config()
-        self.source_type = SourceType(self.config['source_type'])
-
-        # Setup ZMQ publisher socket
-        port = self.config.get('publish_port', 5555)
-        self.socket = self.zmq_context.socket(zmq.PUB)
-        self.socket.bind(f"tcp://*:{port}")
-        self.logger.info(f"Publisher bound to tcp://*:{port}")
-
-        # Initialize source
-        self.cap = None
-        self.frame_count = 0
-        self.start_time = time.time()
-
-        # Give subscribers time to connect
-        time.sleep(1)
-
-    def _load_config(self):
-        """Load configuration from file or environment"""
-        default_config = {
-            'source_type': 'synthetic',  # 'camera' or 'synthetic'
-            'publish_port': 5555,
-
-            # Camera settings
-            'camera_device': 0,
-            'camera_backend': 'auto',  # 'auto', 'v4l2', 'gstreamer'
-            'camera_buffer_size': 1,
-
-            # Frame settings (applies to both sources)
-            'width': 640,
-            'height': 480,
-            'fps': 30,
-
-            # Synthetic settings
-            'synthetic_pattern': 'moving_shapes',  # 'moving_shapes', 'color_bars', 'checkerboard'
-            'synthetic_motion_speed': 1.0,
-
-            # Processing options
-            'add_timestamp': True,
-            'add_frame_number': True,
-            'add_source_label': True
+        # Pre-allocate buffers to avoid repeated allocations
+        self.frame_buffer: Optional[np.ndarray] = None
+        self.metadata_template = {
+            "frame_id": 0,
+            "timestamp": 0.0,
+            "width": 0,
+            "height": 0,
+            "channels": 0,
+            "source": "mp4_python"
         }
 
-        # Try to load from config file
-        config_path = os.environ.get('FRAME_PUBLISHER_CONFIG', '/etc/jvideo/frame-publisher.conf')
+        # ZMQ setup with memory limits
+        self.context = zmq.Context(io_threads=1)
+        self.socket = self.context.socket(zmq.PUB)
+        self.socket.setsockopt(zmq.SNDHWM, 100)  # High water mark
+        self.socket.setsockopt(zmq.SNDTIMEO, 100)  # Send timeout
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.bind("tcp://*:5555")
 
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, 'r') as f:
-                    user_config = json.load(f)
-                    default_config.update(user_config)
-                    self.logger.info(f"Loaded config from {config_path}")
-            except Exception as e:
-                self.logger.warning(f"Failed to load config: {e}, using defaults")
+        # Redis connection
+        self.redis_client = redis.Redis(
+            host='127.0.0.1',
+            port=6379,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2
+        )
 
-        # Override with environment variables
-        if 'JVIDEO_SOURCE_TYPE' in os.environ:
-            default_config['source_type'] = os.environ['JVIDEO_SOURCE_TYPE']
-        if 'JVIDEO_CAMERA_DEVICE' in os.environ:
-            default_config['camera_device'] = int(os.environ['JVIDEO_CAMERA_DEVICE'])
-        if 'JVIDEO_WIDTH' in os.environ:
-            default_config['width'] = int(os.environ['JVIDEO_WIDTH'])
-        if 'JVIDEO_HEIGHT' in os.environ:
-            default_config['height'] = int(os.environ['JVIDEO_HEIGHT'])
-        if 'JVIDEO_FPS' in os.environ:
-            default_config['fps'] = int(os.environ['JVIDEO_FPS'])
+        # Memory monitoring
+        self.process = psutil.Process()
+        self.frames_published = 0
 
-        return default_config
-
-    def _init_camera(self):
-        """Initialize camera source"""
-        device = self.config['camera_device']
-
-        # Determine backend
-        backend = cv2.CAP_ANY
-        if self.config['camera_backend'] == 'v4l2':
-            backend = cv2.CAP_V4L2
-        elif self.config['camera_backend'] == 'gstreamer':
-            backend = cv2.CAP_GSTREAMER
-
-        self.logger.info(f"Initializing camera device {device}")
-
-        # Open camera
-        self.cap = cv2.VideoCapture(device, backend)
+    def setup_video_capture(self, video_path: str) -> bool:
+        """Setup video capture with memory-conscious settings"""
+        self.cap = cv2.VideoCapture(video_path)
 
         if not self.cap.isOpened():
-            self.logger.error(f"Failed to open camera device {device}")
-            # Try alternative devices
-            for alt_device in [0, 1, '/dev/video0', '/dev/video1']:
-                if alt_device != device:
-                    self.logger.info(f"Trying device: {alt_device}")
-                    self.cap = cv2.VideoCapture(alt_device)
-                    if self.cap.isOpened():
-                        device = alt_device
-                        break
+            return False
 
-            if not self.cap.isOpened():
-                self.logger.error("No camera found, falling back to synthetic")
-                self.source_type = SourceType.SYNTHETIC
-                return self._init_synthetic()
+        # Minimize buffering
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        # Configure camera
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config['width'])
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config['height'])
-        self.cap.set(cv2.CAP_PROP_FPS, self.config['fps'])
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, self.config['camera_buffer_size'])
+        # Get video properties and pre-allocate frame buffer
+        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Get actual settings
-        actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        # Pre-allocate frame buffer (reuse same memory)
+        self.frame_buffer = np.empty((height, width, 3), dtype=np.uint8)
 
-        self.logger.info(
-            f"Camera initialized: {actual_width}x{actual_height} @ {actual_fps}fps"
-        )
-
-        # Update config with actual values
-        self.config['width'] = actual_width
-        self.config['height'] = actual_height
-        if actual_fps > 0:
-            self.config['fps'] = actual_fps
-
+        print(f"[Python] Pre-allocated frame buffer: {width}x{height}")
         return True
 
-    def _init_synthetic(self):
-        """Initialize synthetic source"""
-        self.logger.info(
-            f"Synthetic source initialized: {self.config['width']}x{self.config['height']} "
-            f"@ {self.config['fps']}fps, pattern: {self.config['synthetic_pattern']}"
-        )
-        return True
+    @contextmanager
+    def memory_monitor(self):
+        """Context manager to monitor memory usage"""
+        before = self.process.memory_info().rss / 1024 / 1024  # MB
+        yield
+        after = self.process.memory_info().rss / 1024 / 1024   # MB
+        if after - before > 10:  # Alert if memory increased by >10MB
+            print(f"[Memory] Increased by {after - before:.1f}MB")
 
-    def _get_camera_frame(self):
-        """Get frame from camera"""
-        if self.cap is None:
-            return None
+    def update_memory_metrics(self):
+        """Update memory metrics in Redis"""
+        memory_info = self.process.memory_info()
+        self.redis_client.hset("metrics:frame-publisher-python", mapping={
+            "memory_rss_mb": round(memory_info.rss / 1024 / 1024, 2),
+            "memory_vms_mb": round(memory_info.vms / 1024 / 1024, 2),
+            "frames_published": self.frames_published
+        })
 
-        ret, frame = self.cap.read()
-        if not ret:
-            self.logger.warning("Failed to read from camera")
-            return None
+    def publish_frames(self):
+        """Main publishing loop with memory optimizations"""
+        frame_id = 0
 
-        return frame
+        while True:
+            with self.memory_monitor():
+                # Read frame into pre-allocated buffer
+                ret = self.cap.read(self.frame_buffer)
+                if not ret or self.frame_buffer is None:
+                    break
 
-    def _generate_synthetic_frame(self):
-        """Generate synthetic frame based on pattern"""
-        width = self.config['width']
-        height = self.config['height']
-        pattern = self.config['synthetic_pattern']
-        speed = self.config['synthetic_motion_speed']
+                # Update metadata template (reuse object)
+                self.metadata_template.update({
+                    "frame_id": frame_id,
+                    "timestamp": time.time(),
+                    "width": self.frame_buffer.shape[1],
+                    "height": self.frame_buffer.shape[0],
+                    "channels": self.frame_buffer.shape[2]
+                })
 
-        # Create base frame
-        frame = np.zeros((height, width, 3), dtype=np.uint8)
+                # Serialize metadata once
+                metadata_bytes = json.dumps(self.metadata_template).encode('utf-8')
 
-        # Time for animation
-        t = (time.time() - self.start_time) * speed
+                try:
+                    # Non-blocking send to prevent memory buildup
+                    self.socket.send(metadata_bytes, zmq.SNDMORE | zmq.NOBLOCK)
 
-        if pattern == 'moving_shapes':
-            # Background gradient
-            for y in range(height):
-                val = int(20 + 10 * np.sin(y / 50.0 + t * 0.5))
-                frame[y, :] = (val, val//2, val//3)
+                    # Send frame data directly from numpy array
+                    frame_bytes = self.frame_buffer.tobytes()
+                    self.socket.send(frame_bytes, zmq.NOBLOCK)
 
-            # Moving circles
-            num_circles = 3
-            for i in range(num_circles):
-                phase = 2 * np.pi * i / num_circles
-                cx = int(width * (0.5 + 0.3 * np.sin(t + phase)))
-                cy = int(height * (0.5 + 0.3 * np.cos(t * 0.7 + phase)))
+                    self.frames_published += 1
 
-                color = (
-                    int(127 + 127 * np.sin(t + phase)),
-                    int(127 + 127 * np.sin(t + phase + 2*np.pi/3)),
-                    int(127 + 127 * np.sin(t + phase + 4*np.pi/3))
-                )
-                cv2.circle(frame, (cx, cy), 30, color, -1)
+                except zmq.Again:
+                    # Skip frame if can't send (prevents memory buildup)
+                    print(f"[Python] Dropped frame {frame_id} - slow subscribers")
+                    continue
 
-            # Moving rectangle
-            rx = int(width * (0.5 + 0.4 * np.cos(t * 0.8)))
-            ry = height // 3
-            cv2.rectangle(frame,
-                         (rx - 40, ry - 20),
-                         (rx + 40, ry + 20),
-                         (255, 200, 0), -1)
+                frame_id += 1
 
-        elif pattern == 'color_bars':
-            # SMPTE-style color bars
-            colors = [
-                (192, 192, 192),  # Gray
-                (192, 192, 0),    # Yellow
-                (0, 192, 192),    # Cyan
-                (0, 192, 0),      # Green
-                (192, 0, 192),    # Magenta
-                (192, 0, 0),      # Red
-                (0, 0, 192),      # Blue
-            ]
+                # Periodic maintenance
+                if frame_id % 300 == 0:
+                    self.update_memory_metrics()
+                    # Force garbage collection periodically
+                    gc.collect()
+                    print(f"[Python] Published {self.frames_published} frames")
 
-            bar_width = width // len(colors)
-            for i, color in enumerate(colors):
-                x_start = i * bar_width
-                x_end = (i + 1) * bar_width if i < len(colors) - 1 else width
-                frame[:, x_start:x_end] = color
+                # Rate limiting
+                time.sleep(0.033)  # ~30 FPS
 
-            # Animated line
-            line_y = int(height * (0.5 + 0.4 * np.sin(t)))
-            cv2.line(frame, (0, line_y), (width, line_y), (255, 255, 255), 2)
-
-        elif pattern == 'checkerboard':
-            # Animated checkerboard
-            square_size = 40
-            offset = int(t * 10) % (square_size * 2)
-
-            for y in range(0, height, square_size):
-                for x in range(0, width, square_size):
-                    if ((x + offset) // square_size + y // square_size) % 2 == 0:
-                        cv2.rectangle(frame,
-                                    (x, y),
-                                    (min(x + square_size, width), min(y + square_size, height)),
-                                    (255, 255, 255), -1)
-
-        return frame
-
-    def _add_overlays(self, frame):
-        """Add text overlays to frame"""
-        if frame is None:
-            return frame
-
-        height, width = frame.shape[:2]
-
-        # Source type label
-        if self.config.get('add_source_label', True):
-            label = f"{self.source_type.value.upper()}"
-            if self.source_type == SourceType.SYNTHETIC:
-                label += f" ({self.config['synthetic_pattern']})"
-
-            cv2.putText(frame, label,
-                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                       0.7, (255, 255, 255), 2)
-
-        # Frame number
-        if self.config.get('add_frame_number', True):
-            cv2.putText(frame, f"Frame: {self.frame_count}",
-                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
-                       0.6, (255, 255, 255), 1)
-
-        # Timestamp
-        if self.config.get('add_timestamp', True):
-            timestamp = time.strftime("%H:%M:%S")
-            cv2.putText(frame, timestamp,
-                       (width - 100, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                       0.6, (255, 255, 255), 1)
-
-        # FPS indicator
-        elapsed = time.time() - self.start_time
-        if elapsed > 0:
-            actual_fps = self.frame_count / elapsed
-            cv2.putText(frame, f"FPS: {actual_fps:.1f}",
-                       (width - 100, 60), cv2.FONT_HERSHEY_SIMPLEX,
-                       0.6, (255, 255, 255), 1)
-
-        return frame
-
-    def run(self):
-        """Main publishing loop"""
-        # Initialize source
-        if self.source_type == SourceType.CAMERA:
-            if not self._init_camera():
-                return False
-        else:
-            if not self._init_synthetic():
-                return False
-
-        # Publishing configuration
-        target_fps = self.config['fps']
-        frame_delay = 1.0 / target_fps if target_fps > 0 else 0.033
-
-        self.logger.info(f"Starting frame publishing from {self.source_type.value}")
-        self.logger.info(f"Target: {self.config['width']}x{self.config['height']} @ {target_fps}fps")
-
-        # Update Redis with source info
-        if self.redis_available:
-            source_info = {
-                'source_type': self.source_type.value,
-                'width': self.config['width'],
-                'height': self.config['height'],
-                'fps': self.config['fps'],
-                'implementation': os.environ.get('JVIDEO_SERVICE_IMPL', 'python')
-            }
-            try:
-                self.redis.hset(f"source:{self.service_name}", mapping=source_info)
-            except:
-                pass
-
-        # Main loop
-        last_log_time = time.time()
-
-        while self.running:
-            loop_start = time.time()
-
-            # Get frame based on source type
-            if self.source_type == SourceType.CAMERA:
-                frame = self._get_camera_frame()
-            else:
-                frame = self._generate_synthetic_frame()
-
-            if frame is None:
-                self.logger.error("Failed to get frame")
-                time.sleep(0.1)
-                continue
-
-            # Add overlays
-            frame = self._add_overlays(frame)
-
-            # Prepare metadata
-            metadata = {
-                'frame_id': self.frame_count,
-                'timestamp': time.time(),
-                'width': frame.shape[1],
-                'height': frame.shape[0],
-                'channels': 3,
-                'source_type': self.source_type.value,
-                'implementation': os.environ.get('JVIDEO_SERVICE_IMPL', 'python')
-            }
-
-            try:
-                # Send as multipart message
-                self.socket.send_json(metadata, zmq.SNDMORE)
-                self.socket.send(frame.tobytes())
-
-                # Update metrics
-                self.frame_count += 1
-                self.update_metrics('frames_processed', self.frame_count)
-                self.update_metrics('last_frame_id', self.frame_count)
-
-            except Exception as e:
-                self.logger.error(f"Error publishing frame {self.frame_count}: {e}")
-                self.update_metrics('errors', self.metrics.get('errors', 0) + 1)
-
-            # Log progress periodically
-            if time.time() - last_log_time > 5:
-                self.log_metrics()
-                last_log_time = time.time()
-
-            # Maintain frame rate
-            elapsed = time.time() - loop_start
-            sleep_time = frame_delay - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
-        # Cleanup
-        if self.cap is not None:
+    def cleanup(self):
+        """Cleanup resources"""
+        if hasattr(self, 'cap'):
             self.cap.release()
+        self.socket.close()
+        self.context.term()
 
-        self.logger.info("Frame publishing stopped")
-        return True
+
+# Memory optimization functions
+def optimize_python_memory():
+    """Apply Python-specific memory optimizations"""
+    # Tune garbage collection
+    gc.set_threshold(700, 10, 10)  # More aggressive GC
+
+    # Disable debug mode if enabled
+    if hasattr(sys, 'gettrace') and sys.gettrace() is not None:
+        sys.settrace(None)
+
+    # Set recursion limit lower to save stack space
+    sys.setrecursionlimit(500)  # Default is usually 1000
 
 
 def main():
-    # Parse command line arguments for quick testing
-    if len(sys.argv) > 1:
-        arg = sys.argv[1]
+    """Main entry point with memory monitoring"""
+    optimize_python_memory()
 
-        # Quick source type override
-        if arg in ['camera', 'synthetic']:
-            os.environ['JVIDEO_SOURCE_TYPE'] = arg
-            print(f"Using source type: {arg}")
-
-        # Camera device number
-        elif arg.isdigit():
-            os.environ['JVIDEO_SOURCE_TYPE'] = 'camera'
-            os.environ['JVIDEO_CAMERA_DEVICE'] = arg
-            print(f"Using camera device: {arg}")
-
-    # Create and run publisher
-    publisher = FramePublisher()
+    publisher = MemoryOptimizedFramePublisher()
 
     try:
-        publisher.run()
+        video_path = sys.argv[1] if len(sys.argv) > 1 else "/opt/jvideo/input.mp4"
+
+        if not publisher.setup_video_capture(video_path):
+            print("[Python] Failed to open video")
+            return 1
+
+        print(f"[Python] Starting frame publishing...")
+        publisher.publish_frames()
+
     except KeyboardInterrupt:
-        publisher.logger.info("Keyboard interrupt received")
+        print("[Python] Shutting down...")
     except Exception as e:
-        publisher.logger.error(f"Fatal error: {e}")
-        import traceback
-        publisher.logger.error(traceback.format_exc())
-        sys.exit(1)
+        print(f"[Python] Error: {e}")
+        return 1
     finally:
-        publisher.logger.info("Shutting down frame publisher")
-        if hasattr(publisher, 'cap') and publisher.cap is not None:
-            publisher.cap.release()
-        if hasattr(publisher, 'socket'):
-            publisher.socket.close()
-        if hasattr(publisher, 'zmq_context'):
-            publisher.zmq_context.term()
+        publisher.cleanup()
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())

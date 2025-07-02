@@ -14,7 +14,40 @@ StandardOutput=journal
 StandardError=journal
 WorkingDirectory=/opt/jvideo
 
+# Memory Management (Critical for Yocto)
+MemoryLimit=256M
+MemorySwapMax=0
+MemoryAccounting=yes
+
+# Process Management
+TasksMax=20
+LimitNOFILE=1024
+LimitNPROC=10
+
+# Priority and Resource Control
+Nice=5
+OOMScoreAdjust=100
+CPUQuota=80%
+
+# Environment Variables
 Environment="JVIDEO_SERVICE_IMPL=cpp"
+# Reduce threading to minimize memory overhead
+Environment="OMP_NUM_THREADS=1"
+Environment="OPENCV_FOR_THREADS_NUM=1"
+Environment="ZMQ_IO_THREADS=1"
+# OpenCV optimizations for embedded systems
+Environment="OPENCV_FFMPEG_CAPTURE_OPTIONS=threads;1"
+Environment="OPENCV_LOG_LEVEL=ERROR"
+
+# Security (optional but recommended for production)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/jvideo /tmp
+
+# Watchdog (optional - restart if service becomes unresponsive)
+WatchdogSec=30
+NotifyAccess=all
 
 [Install]
 WantedBy=multi-user.target

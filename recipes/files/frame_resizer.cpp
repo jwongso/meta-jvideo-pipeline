@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <sstream>
 #include <ctime>
+#include <cstring>
 #include <sys/stat.h>
 #include <hiredis/hiredis.h>
 
@@ -421,7 +422,8 @@ public:
             zmq::message_t meta_out_msg(meta_out.begin(), meta_out.end());
             pub_socket.send(meta_out_msg, zmq::send_flags::sndmore);
 
-            zmq::message_t frame_out_msg(resized.data, resized.total() * resized.elemSize());
+            zmq::message_t frame_out_msg(resized.total() * resized.elemSize());
+            std::memcpy(frame_out_msg.data(), resized.data, resized.total() * resized.elemSize());
             pub_socket.send(frame_out_msg, zmq::send_flags::none);
 
             frames_published++;

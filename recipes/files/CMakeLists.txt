@@ -11,6 +11,10 @@ pkg_check_modules(HIREDIS REQUIRED hiredis)
 # Find nlohmann-json
 find_package(nlohmann_json REQUIRED)
 
+set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -ffunction-sections -fdata-sections")
+set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-Wl,--gc-sections")
+
 # Frame Publisher executable
 add_executable(frame-publisher-cpp frame_publisher.cpp)
 target_include_directories(frame-publisher-cpp PRIVATE
