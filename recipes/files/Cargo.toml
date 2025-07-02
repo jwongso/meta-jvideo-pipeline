@@ -1,0 +1,20 @@
+[package]
+name = "jvideo-rust-services"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "frame-publisher-rust"
+path = "frame_publisher.rs"
+
+[dependencies]
+zmq = "0.10"
+opencv = { version = "0.88", features = ["opencv-4"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+ctrlc = "3.4"
+
+[profile.release]
+lto = true
+opt-level = 3

@@ -1,0 +1,17 @@
+[Unit]
+Description=Juni's Frame Saver Service (C++)
+After=network.target redis.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/jvideo
+Environment="JVIDEO_SERVICE_IMPL=cpp"
+ExecStart=/opt/jvideo/bin/frame-saver-cpp
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

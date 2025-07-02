@@ -1,0 +1,18 @@
+[Unit]
+Description=Juni's Queue Monitor Service
+After=network.target redis.service
+Wants=redis.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/jvideo
+Environment="PYTHONPATH=/opt/jvideo/services"
+ExecStart=/usr/bin/python3 /opt/jvideo/services/queue_monitor.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

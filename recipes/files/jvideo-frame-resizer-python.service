@@ -1,0 +1,18 @@
+[Unit]
+Description=Juni's Frame Resizer Service (Python)
+After=network.target redis.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/jvideo
+Environment="PYTHONPATH=/opt/jvideo/services"
+Environment="JVIDEO_SERVICE_IMPL=python"
+ExecStart=/usr/bin/python3 /opt/jvideo/services/frame_resizer.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

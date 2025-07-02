@@ -1,0 +1,20 @@
+[Unit]
+Description=Juni's Frame Publisher Service (Rust)
+After=network.target redis.service
+Wants=redis.service
+Conflicts=jvideo-frame-publisher-python.service jvideo-frame-publisher-cpp.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /var/log/jvideo
+ExecStart=/opt/jvideo/bin/frame-publisher-rust
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+WorkingDirectory=/opt/jvideo
+
+Environment="JVIDEO_SERVICE_IMPL=rust"
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Juni's Frame Publisher Service (Python)
+After=network.target redis.service
+Wants=redis.service
+Conflicts=jvideo-frame-publisher-cpp.service jvideo-frame-publisher-rust.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /var/log/jvideo
+ExecStart=/usr/bin/python3 /opt/jvideo/services/frame_publisher.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+WorkingDirectory=/opt/jvideo
+
+Environment="PYTHONUNBUFFERED=1"
+Environment="JVIDEO_SERVICE_IMPL=python"
+
+[Install]
+WantedBy=multi-user.target

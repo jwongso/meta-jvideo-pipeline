@@ -1,0 +1,20 @@
+[Unit]
+Description=Juni's Frame Publisher Service (C++)
+After=network.target redis.service
+Wants=redis.service
+Conflicts=jvideo-frame-publisher-python.service jvideo-frame-publisher-rust.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /var/log/jvideo
+ExecStart=/opt/jvideo/bin/frame-publisher-cpp
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+WorkingDirectory=/opt/jvideo
+
+Environment="JVIDEO_SERVICE_IMPL=cpp"
+
+[Install]
+WantedBy=multi-user.target
