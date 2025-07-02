@@ -1,6 +1,6 @@
 # Juni's Video Pipeline
 
-A high-performance, multi-language video processing pipeline designed for embedded Linux systems running on Yocto. The system provides distributed video frame processing with dynamic language implementation switching, comprehensive monitoring, and robust service management.
+A high-performance, multi-language video processing pipeline designed for embedded Linux systems built with Yocto. The system provides distributed video frame processing with dynamic language implementation switching, comprehensive monitoring, and robust service management through a custom Yocto meta-layer.
 
 ## Architecture Overview
 
@@ -14,97 +14,220 @@ Juni's Video Pipeline implements a microservices architecture where video frames
 - **Frame Saver**: Video frame persistence and storage service
 - **Queue Monitor**: Pipeline health monitoring and performance tracking
 
+## Yocto Integration
+
+This project is delivered as a complete Yocto meta-layer (`meta-jvideo-pipeline`) that provides:
+
+- BitBake recipes for all service implementations
+- Systemd service files for automatic startup
+- Configuration management
+- Multi-language build support (Python, C++, Rust)
+- Test content and dependencies
+
+### Meta-Layer Structure
+
+```
+meta-jvideo-pipeline/
+├── conf/
+│   └── layer.conf                    # Layer configuration
+├── recipes/
+│   ├── files/                        # Service implementations and configs
+│   │   ├── service_controller.py     # Main service controller
+│   │   ├── service_base.py          # Base class for services
+│   │   ├── frame_publisher.*        # Publisher implementations (py/cpp/rs)
+│   │   ├── frame_resizer.*          # Resizer implementations (py/cpp)
+│   │   ├── frame_saver.*            # Saver implementations (py/cpp)
+│   │   ├── queue_monitor.py         # Queue monitoring service
+│   │   ├── *.service                # Systemd service files
+│   │   └── *.conf                   # Service configuration files
+│   ├── jvideo-services.bb           # Main services recipe
+│   └── jvideo-pipeline-image.bb     # Complete image recipe
+├── recipes-devtools/
+│   └── nlohmann-json/               # JSON library dependency
+└── recipes-multimedia/
+    └── jvideo-content.bb            # Test content recipe
+```
+
 ## System Requirements
 
-### Hardware
-- ARM or x86_64 processor
-- Minimum 512MB RAM (1GB recommended)
-- Storage for video processing and logs
-
-### Software
-- Yocto Linux distribution
+### Build Host Requirements
+- Yocto Kirkstone (4.0) compatible build environment
 - Python 3.6+
-- systemd service manager
+- Rust toolchain (for Rust implementations)
+- CMake 3.10+ (for C++ implementations)
+- 12+ CPU cores recommended (configured for parallel builds)
+
+### Target Hardware
+- x86_64 processor (QEMU x86-64 target configured)
+- 1GB RAM (enforced via QB_MEM configuration)
+- Storage for video processing and logs
+- Hardware video acceleration support (optional)
+
+### Runtime Dependencies
+- systemd service manager (configured as init system)
 - ZeroMQ library
 - Redis server (optional, for metrics)
+- OpenCV with FFmpeg support
+- GStreamer 1.0 multimedia framework
+- FFmpeg with commercial codec support
 
-### Dependencies
-- `python3-zmq`
-- `python3-redis`
-- `systemd`
-- Language-specific compilers (gcc, rustc) for native implementations
+## Building with Yocto
 
-## Installation
-
-### 1. System Setup
+### 1. Layer Setup
 ```bash
-# Create system directories
-sudo mkdir -p /var/log/jvideo
-sudo mkdir -p /etc/jvideo
+# Add meta-layer to your build configuration
+echo 'BBLAYERS += "/path/to/meta-jvideo-pipeline"' >> conf/bblayers.conf
 
-# Create service user
-sudo useradd -r -s /bin/false jvideo
-sudo chown -R jvideo:jvideo /var/log/jvideo
+# Layer automatically configures:
+# - SystemD as init manager
+# - Commercial codec licensing
+# - FFmpeg with advanced codec support (H.264, H.265, VP8/VP9, MP3)
+# - OpenCV with FFmpeg and GStreamer integration
+# - 12-thread parallel compilation
+# - 1GB target memory allocation
 ```
 
-### 2. Service Installation
-```bash
-# Copy service binaries
-sudo cp service_controller.py /usr/local/bin/control
-sudo cp service_base.py /usr/local/lib/python3.x/site-packages/
-sudo chmod +x /usr/local/bin/control
+### 2. Build Options
 
-# Install systemd service files
-sudo cp systemd/*.service /etc/systemd/system/
-sudo systemctl daemon-reload
+**Build Individual Services**
+```bash
+# Build all services
+bitbake jvideo-services
+
+# Build with specific language implementations
+bitbake jvideo-services -c configure
 ```
 
-### 3. Configuration
+**Build Complete Image**
 ```bash
-# Create default configuration
-sudo cp config/services.conf /etc/jvideo/
-sudo chown jvideo:jvideo /etc/jvideo/services.conf
+# Build complete system image with pipeline
+bitbake jvideo-pipeline-image
 ```
 
-## Configuration
+**Build with Test Content**
+```bash
+# Include test video content
+bitbake jvideo-content
+```
 
-### Service Configuration File
-Location: `/etc/jvideo/services.conf`
+### 3. Deployment
+```bash
+# Flash to target device
+dd if=tmp/deploy/images/MACHINE/jvideo-pipeline-image-MACHINE.wic of=/dev/sdX bs=4M
 
+# Or deploy to running system
+scp tmp/deploy/rpm/ARCH/jvideo-services-*.rpm root@target:/tmp/
+rpm -Uvh /tmp/jvideo-services-*.rpm
+```
+
+## Multimedia Support
+
+The layer provides comprehensive multimedia processing capabilities through integrated support for:
+
+### Video Codecs and Formats
+- **H.264/AVC**: Hardware-accelerated encoding and decoding
+- **H.265/HEVC**: Next-generation video compression
+- **VP8/VP9**: WebM video codecs for web delivery
+- **MJPEG**: Motion JPEG for high-quality frame sequences
+
+### Audio Codecs
+- **MP3**: LAME encoder integration
+- **AAC**: Advanced Audio Coding support
+- **Vorbis**: Open-source audio compression
+
+### Multimedia Frameworks
+- **FFmpeg**: Complete multimedia framework with commercial codec support
+- **OpenCV**: Computer vision library with video I/O capabilities
+- **GStreamer 1.0**: Modular multimedia pipeline framework
+
+### Development and Debugging Tools
+- **v4l-utils**: Video4Linux utilities for camera management
+- **GStreamer examples**: Sample applications and plugins
+- **FFmpeg command-line tools**: Direct video processing capabilities
+
+### Hardware Integration
+- **Video4Linux (V4L2)**: Camera and capture device support
+- **Hardware acceleration**: GPU-assisted video processing where available
+- **Memory optimization**: 1GB allocation with efficient buffer management
+
+### Service Configuration
+Service configurations are deployed to `/etc/jvideo/` during build:
+
+**Frame Publisher** (`/etc/jvideo/frame-publisher.conf`)
+```ini
+[input]
+source_type = camera
+device_path = /dev/video0
+resolution = 1920x1080
+framerate = 30
+
+[output]
+zmq_endpoint = tcp://localhost:5555
+```
+
+**Frame Resizer** (`/etc/jvideo/frame-resizer.conf`)
+```ini
+[input]
+zmq_endpoint = tcp://localhost:5555
+
+[processing]
+target_resolutions = 720p,480p,240p
+quality = high
+
+[output]
+zmq_endpoint = tcp://localhost:5556
+```
+
+**Frame Saver** (`/etc/jvideo/frame-saver.conf`)
+```ini
+[input]
+zmq_endpoint = tcp://localhost:5556
+
+[storage]
+output_directory = /var/lib/jvideo/frames
+format = jpeg
+compression_quality = 85
+```
+
+**Queue Monitor** (`/etc/jvideo/queue-monitor.conf`)
+```ini
+[monitoring]
+check_interval = 5
+alert_threshold = 1000
+metrics_endpoint = tcp://localhost:5557
+```
+
+### Runtime Service Configuration
 ```json
 {
   "services": {
     "frame-publisher": {
       "enabled": true,
-      "language": "cpp"
+      "language": "cpp",
+      "priority": "high"
     },
     "frame-resizer": {
       "enabled": true,
-      "language": "cpp"
+      "language": "cpp",
+      "auto_scale": true
     },
     "frame-saver": {
       "enabled": true,
-      "language": "python"
+      "language": "python",
+      "storage_backend": "local"
     },
     "queue-monitor": {
       "enabled": true,
-      "language": "python"
+      "language": "python",
+      "alert_enabled": true
     }
   }
 }
 ```
 
-### Logging Configuration
-Logs are written to `/var/log/jvideo/` with the following structure:
-- `service-controller.log`: Central controller operations
-- `frame-publisher.log`: Publisher service logs
-- `frame-resizer.log`: Resizer service logs
-- `frame-saver.log`: Saver service logs
-- `queue-monitor.log`: Monitor service logs
-
 ## Usage
 
-### Basic Operations
+### Service Management
 
 **View Service Status**
 ```bash
@@ -116,201 +239,233 @@ control status
 # Start with default implementation
 control start frame-publisher
 
-# Start with specific language implementation
+# Start with specific language implementation  
 control start frame-publisher cpp
 control start frame-resizer python
 ```
 
-**Stop Services**
-```bash
-control stop frame-publisher
-control stop frame-resizer
-```
-
-**Switch Implementation Language**
+**Dynamic Implementation Switching**
 ```bash
 # Hot-swap to different implementation
 control switch frame-publisher rust
 control switch frame-resizer cpp
 ```
 
-**Restart Services**
-```bash
-control restart frame-publisher
-```
-
 **Apply Configuration**
 ```bash
-# Apply default configuration
-control apply
-
-# Apply specific configuration file
-control apply /path/to/custom/services.conf
+# Apply service configuration
+control apply /etc/jvideo/services.conf
 ```
 
-**Monitor Services**
+**System Monitoring**
 ```bash
-# Continuous monitoring mode
+# Continuous monitoring
 control monitor
 ```
 
-### Advanced Operations
+### Service Implementations
 
-**Batch Service Management**
+**Available Implementations by Service:**
+
+| Service | Python | C++ | Rust | Default |
+|---------|--------|-----|------|---------|
+| frame-publisher | ✓ | ✓ | ✓ | cpp |
+| frame-resizer | ✓ | ✓ | - | cpp |  
+| frame-saver | ✓ | ✓ | - | cpp |
+| queue-monitor | ✓ | - | - | python |
+
+**Performance Characteristics:**
+
+- **C++ Implementations**: Optimized for throughput and low latency
+- **Python Implementations**: Flexible configuration and rapid development
+- **Rust Implementations**: Memory-safe high-performance processing
+
+## Development and Customization
+
+**Layer Dependencies and Compatibility**
 ```bash
-# Start all services with optimal implementations
-control apply /etc/jvideo/production.conf
-
-# Monitor system performance
-control monitor &
-tail -f /var/log/jvideo/service-controller.log
+# layer.conf configuration
+LAYERDEPENDS_jvideo-pipeline = "core"
+LAYERSERIES_COMPAT_jvideo-pipeline = "kirkstone"
+BBFILE_PRIORITY_jvideo-pipeline = "10"
 ```
 
-## Service Implementations
-
-### Language-Specific Implementations
-
-**C++ Implementations**
-- Optimized for high-throughput video processing
-- Minimal memory footprint
-- Direct hardware acceleration support
-- Recommended for production deployments
-
-**Python Implementations**
-- Rapid development and prototyping
-- Extensive library ecosystem
-- Flexible configuration options
-- Ideal for development and testing
-
-**Rust Implementations**
-- Memory safety without garbage collection
-- High performance with safety guarantees
-- Concurrent processing capabilities
-- Suitable for safety-critical applications
-
-## Monitoring and Metrics
-
-### Redis Metrics
-When Redis is available, the system automatically collects:
-- Frame processing rates
-- Error counts and types
-- Service uptime and performance
-- Queue depth and latency metrics
-
-### Service Health Monitoring
+**Optimized Build Configuration**
 ```bash
-# Real-time status monitoring
-control status
+# Parallel build settings (configured in layer)
+BB_NUMBER_THREADS = "12"
+PARALLEL_MAKE = "-j 12"
 
-# Detailed service information
-systemctl status jvideo-frame-publisher-cpp.service
-systemctl status jvideo-frame-resizer-cpp.service
+# Target system configuration
+MACHINE = "qemux86-64"
+QB_MEM = "-m 1024"
+APPEND += "mem=1024M"
 ```
 
-### Log Analysis
+**Recipe Dependencies**
 ```bash
-# Monitor service logs
-tail -f /var/log/jvideo/frame-publisher.log
-
-# Search for errors
-grep ERROR /var/log/jvideo/*.log
-
-# Performance metrics
-grep "Metrics" /var/log/jvideo/*.log
+# jvideo-services.bb dependencies
+DEPENDS = "zeromq opencv python3-redis cmake-native ffmpeg gstreamer1.0"
+RDEPENDS_${PN} = "systemd zeromq python3-core python3-redis ffmpeg \
+                  gstreamer1.0 gstreamer1.0-plugins-base \
+                  gstreamer1.0-plugins-good v4l-utils"
 ```
 
-## Performance Tuning
+**Cross-Compilation Support**
+```bash
+# C++ cross-compilation with multimedia support
+inherit cmake
+EXTRA_OECMAKE = "-DCMAKE_BUILD_TYPE=Release \
+                 -DENABLE_OPTIMIZATION=ON \
+                 -DWITH_FFMPEG=ON \
+                 -DWITH_GSTREAMER=ON"
 
-### CPU Optimization
-- Use C++ implementations for CPU-intensive services
-- Adjust service priorities using systemd
-- Configure CPU affinity for critical services
+# Rust cross-compilation  
+inherit cargo
+CARGO_SRC_DIR = "${S}"
+```
 
-### Memory Management
-- Monitor memory usage through service logs
-- Use Rust implementations for memory-sensitive environments
-- Configure appropriate swap settings
+### Adding Custom Implementations
 
-### Network Optimization
-- Tune ZeroMQ buffer sizes
-- Configure Redis memory policies
-- Optimize inter-service communication patterns
+**1. Create Implementation File**
+```bash
+# Add to recipes/files/
+cp frame_publisher.py custom_frame_publisher.py
+```
+
+**2. Create Service File**
+```bash
+# Add systemd service file
+cp jvideo-frame-publisher-python.service jvideo-frame-publisher-custom.service
+```
+
+**3. Update BitBake Recipe**
+```bash
+# Edit recipes/jvideo-services.bb
+SRC_URI += "file://custom_frame_publisher.py \
+            file://jvideo-frame-publisher-custom.service"
+```
+
+**4. Update Service Controller**
+```python
+# Add to service_controller.py services dictionary
+'frame-publisher': {
+    'languages': ['python', 'cpp', 'rust', 'custom'],
+    'default': 'cpp'
+}
+```
+
+### Build System Integration
+
+**Recipe Dependencies**
+```bash
+# jvideo-services.bb dependencies
+DEPENDS = "zeromq opencv python3-redis cmake-native"
+RDEPENDS_${PN} = "systemd zeromq python3-core python3-redis"
+```
+
+**Cross-Compilation Support**
+```bash
+# C++ cross-compilation
+inherit cmake
+EXTRA_OECMAKE = "-DCMAKE_BUILD_TYPE=Release -DENABLE_OPTIMIZATION=ON"
+
+# Rust cross-compilation  
+inherit cargo
+CARGO_SRC_DIR = "${S}"
+```
+
+## Monitoring and Debugging
+
+### System Logs
+```bash
+# Service-specific logs
+journalctl -u jvideo-frame-publisher-cpp.service -f
+
+# All pipeline services
+journalctl -u jvideo-* -f
+
+# Application logs
+tail -f /var/log/jvideo/*.log
+```
+
+### Performance Monitoring
+```bash
+# Real-time metrics
+control monitor
+
+# Resource usage
+systemctl status jvideo-*
+htop -p $(pgrep -d, jvideo)
+```
+
+### Debugging Failed Builds
+```bash
+# Debug BitBake builds
+bitbake jvideo-services -c compile -f -D
+
+# Check build logs
+less tmp/work/MACHINE/jvideo-services/*/temp/log.do_compile
+```
+
+## Production Deployment
+
+### Image Customization
+```bash
+# Create custom image recipe
+inherit core-image
+IMAGE_INSTALL += "jvideo-services jvideo-content"
+IMAGE_FEATURES += "ssh-server-openssh"
+```
+
+### Performance Tuning
+- Hardware video acceleration (GPU-assisted processing)
+- Multi-threaded compilation (12 threads configured)
+- Optimized memory allocation (1GB system memory)
+- Advanced codec support (H.264, H.265, VP8/VP9)
+- GStreamer hardware acceleration plugins
+- SIMD optimizations in OpenCV and FFmpeg
+
+### Security Hardening
+- Run services with dedicated user accounts
+- Restrict network access to localhost
+- Enable systemd security features
+- Configure log rotation and retention
 
 ## Troubleshooting
 
-### Common Issues
+### Common Build Issues
 
-**Service Won't Start**
+**Missing Dependencies**
+```bash
+# Check layer dependencies
+bitbake-layers show-layers
+bitbake jvideo-services -g -u taskexp
+```
+
+**Cross-Compilation Errors**
+```bash
+# Clean and rebuild
+bitbake jvideo-services -c clean
+bitbake jvideo-services -f
+```
+
+### Runtime Issues
+
+**Service Startup Failures**
 ```bash
 # Check service status
 systemctl status jvideo-frame-publisher-cpp.service
-
-# Check logs
-journalctl -u jvideo-frame-publisher-cpp.service
-
-# Verify dependencies
-control status
+journalctl -u jvideo-frame-publisher-cpp.service --no-pager
 ```
 
 **Performance Issues**
 ```bash
-# Check system resources
-top -p $(pgrep -d, jvideo)
-
-# Monitor queue depths
-control monitor
-
-# Check for errors
-grep ERROR /var/log/jvideo/*.log
+# Monitor system resources
+iotop -o
+nethogs
+control status
 ```
-
-**Redis Connection Issues**
-```bash
-# Test Redis connectivity
-redis-cli ping
-
-# Check Redis logs
-journalctl -u redis.service
-
-# Verify Redis configuration
-redis-cli info
-```
-
-### Debug Mode
-Enable debug logging by setting environment variables:
-```bash
-export JVIDEO_DEBUG=1
-export JVIDEO_LOG_LEVEL=DEBUG
-control start frame-publisher
-```
-
-## Development
-
-### Adding New Services
-1. Extend `ServiceBase` class for common functionality
-2. Implement service-specific processing logic
-3. Create systemd service file
-4. Add service configuration to controller
-5. Update service registry in `service_controller.py`
-
-### Contributing Language Implementations
-1. Follow existing naming conventions
-2. Implement equivalent functionality across languages
-3. Maintain performance benchmarks
-4. Update systemd service files
-5. Test implementation switching
-
-## Security Considerations
-
-### Access Control
-- Services run as dedicated `jvideo` user
-- Log files have restricted permissions
-- Configuration files secured with appropriate ownership
-
-### Network Security
-- ZeroMQ endpoints bound to localhost by default
-- Redis access restricted to local connections
-- No external network dependencies required
 
 ## License
 
