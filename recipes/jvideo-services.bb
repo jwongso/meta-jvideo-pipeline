@@ -8,6 +8,7 @@ DEPENDS = " \
     zeromq \
     cppzmq \
     opencv \
+    ffmpeg \
     cmake-native \
     pkgconfig-native \
     cargo-native \
@@ -33,6 +34,10 @@ RDEPENDS:${PN} = " \
     redis \
     opencv \
     bash \
+    ffmpeg \
+    libavcodec \
+    libavformat \
+    libavutil \
     "
 
 # Source files - Added new files

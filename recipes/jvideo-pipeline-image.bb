@@ -41,6 +41,15 @@ IMAGE_INSTALL += " \
     redis \
     "
 
+IMAGE_INSTALL += " \
+    ffmpeg \
+    libavcodec \
+    libavformat \
+    libavutil \
+"
+
+IMAGE_INSTALL += "jvideo-content"
+
 # Increase root filesystem size (in KB)
 VIDEO_STORAGE_SIZE_GB = "5"
 IMAGE_ROOTFS_EXTRA_SPACE = "${@int('${VIDEO_STORAGE_SIZE_GB}') * 1024 * 1024}"
