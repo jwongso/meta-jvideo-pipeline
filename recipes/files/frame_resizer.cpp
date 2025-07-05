@@ -295,7 +295,7 @@ class FrameResizer {
             {"output_width", 160},
             {"output_height", 120},
             {"interpolation", "linear"},
-            {"benchmark_db_path", "/tmp/frame_resizer_benchmarks.db"},
+            {"benchmark_db_path", "/var/log/jvideo/frame_resizer_benchmarks.db"},
             {"benchmark_export_interval", 100}
         };
 
