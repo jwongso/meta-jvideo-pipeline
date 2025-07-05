@@ -9,7 +9,6 @@
 #include <memory>
 #include <iomanip>
 #include <sstream>
-// Replace Redis includes with shared memory and SQLite
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -20,6 +19,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <ctime>
+#include <atomic>
 
 using json = nlohmann::json;
 using namespace std::chrono;
@@ -32,225 +32,145 @@ void signal_handler(int sig) {
     g_running = 0;
 }
 
-/**
- * Shared Memory Metrics Structure
- * This structure is mapped to shared memory and contains real-time metrics
- * that can be accessed by monitoring tools or other services without IPC overhead
- */
-struct SharedMetrics {
-    // Service identification
-    char service_name[64];
-    pid_t service_pid;
+#pragma pack(push, 1)
+struct PublisherSharedMetrics {
+    char service_name[64] = "mp4-frame-publisher";
+    pid_t service_pid = getpid();
 
-    // Video properties (set once during initialization)
-    int total_frames;
-    double video_fps;
-    int video_width;
-    int video_height;
+    std::atomic<int> frames_published{0};
+    std::atomic<int> total_frames{0};
+    std::atomic<int> errors{0};
 
-    // Real-time counters (updated frequently)
-    volatile int frames_published;
-    volatile int errors;
-    volatile double current_fps;
+    std::atomic<double> current_fps{0.0};
+    std::atomic<double> video_fps{0.0};
 
-    // Timestamps for monitoring service health
-    volatile time_t last_update_time;
-    volatile time_t service_start_time;
+    std::atomic<int> video_width{0};
+    std::atomic<int> video_height{0};
 
-    // Memory barrier and synchronization
-    volatile int update_counter;  // Incremented on each update for change detection
+    std::atomic<bool> video_healthy{true};
+    char video_path[256] = {0};
+    char _pad[64] = {0};
 
-    // Reserved space for future metrics without breaking compatibility
-    char reserved[256];
+    std::atomic<time_t> last_update_time{0};
+    std::atomic<time_t> service_start_time{time(nullptr)};
+
+    // Explicitly delete copy constructor/assignment for atomic safety
+    PublisherSharedMetrics(const PublisherSharedMetrics&) = delete;
+    PublisherSharedMetrics& operator=(const PublisherSharedMetrics&) = delete;
 };
+#pragma pack(pop)
 
-/**
- * Shared Memory Manager
- * Handles creation, mapping, and cleanup of POSIX shared memory segment
- * for real-time metrics sharing between processes
- */
-class SharedMemoryManager {
-private:
-    static constexpr const char* SHM_NAME = "/mp4_frame_publisher_metrics";
-    static constexpr size_t SHM_SIZE = sizeof(SharedMetrics);
-
-    int shm_fd;                    // File descriptor for shared memory
-    SharedMetrics* metrics_ptr;    // Pointer to mapped shared memory
-    bool is_owner;                 // Whether this process created the shared memory
+class PublisherSharedMemoryManager {
+    int shm_fd = -1;
+    PublisherSharedMetrics* metrics = nullptr;
+    bool is_owner = false;
 
 public:
-    SharedMemoryManager(const std::string& service_name)
-        : shm_fd(-1), metrics_ptr(nullptr), is_owner(false) {
-
-        // Try to create new shared memory segment first
-        shm_fd = shm_open(SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0666);
-
-        if (shm_fd != -1) {
-            // Successfully created new segment - we are the owner
-            is_owner = true;
-            std::cout << "[SHM] Created new shared memory segment\n";
-
-            // Set the size of the shared memory segment
-            if (ftruncate(shm_fd, SHM_SIZE) == -1) {
-                std::cerr << "[SHM] Failed to set shared memory size: " << strerror(errno) << std::endl;
-                close(shm_fd);
-                shm_fd = -1;
-                return;
-            }
-        } else if (errno == EEXIST) {
-            // Segment already exists, try to open it
-            shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
-            if (shm_fd != -1) {
-                std::cout << "[SHM] Opened existing shared memory segment\n";
-            } else {
-                std::cerr << "[SHM] Failed to open existing shared memory: " << strerror(errno) << std::endl;
-                return;
-            }
-        } else {
-            std::cerr << "[SHM] Failed to create shared memory: " << strerror(errno) << std::endl;
-            return;
+    explicit PublisherSharedMemoryManager(const std::string& service_name) {
+        shm_fd = shm_open("/mp4_frame_publisher_metrics", O_CREAT | O_RDWR, 0666);
+        if (shm_fd == -1) {
+            throw std::runtime_error("shm_open failed: " + std::string(strerror(errno)));
         }
 
-        // Map the shared memory into our address space
-        metrics_ptr = static_cast<SharedMetrics*>(
-            mmap(nullptr, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0)
+        if (ftruncate(shm_fd, sizeof(PublisherSharedMetrics)) == -1) {
+            close(shm_fd);
+            throw std::runtime_error("ftruncate failed: " + std::string(strerror(errno)));
+        }
+
+        metrics = static_cast<PublisherSharedMetrics*>(
+            mmap(nullptr, sizeof(PublisherSharedMetrics),
+                 PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0)
         );
 
-        if (metrics_ptr == MAP_FAILED) {
-            std::cerr << "[SHM] Failed to map shared memory: " << strerror(errno) << std::endl;
+        if (metrics == MAP_FAILED) {
             close(shm_fd);
-            shm_fd = -1;
-            metrics_ptr = nullptr;
-            return;
+            throw std::runtime_error("mmap failed: " + std::string(strerror(errno)));
         }
 
-        // Initialize the metrics structure if we created it
-        if (is_owner) {
-            std::memset(metrics_ptr, 0, sizeof(SharedMetrics));
-            strncpy(metrics_ptr->service_name, service_name.c_str(), sizeof(metrics_ptr->service_name) - 1);
-            metrics_ptr->service_pid = getpid();
-            metrics_ptr->service_start_time = time(nullptr);
-            metrics_ptr->last_update_time = time(nullptr);
-        }
-
-        std::cout << "[SHM] Shared memory initialized successfully\n";
+        strncpy(metrics->service_name, service_name.c_str(), 63);
+        metrics->service_pid = getpid();
+        is_owner = true;
     }
 
-    /**
-     * Update real-time metrics in shared memory
-     * These updates are atomic for basic types and very fast
-     */
     void updateMetric(const std::string& key, int value) {
-        if (!metrics_ptr) return;
+        if (!metrics) return;
 
-        if (key == "frames_published") {
-            metrics_ptr->frames_published = value;
-        } else if (key == "errors") {
-            metrics_ptr->errors = value;
-        } else if (key == "total_frames") {
-            metrics_ptr->total_frames = value;
-        } else if (key == "video_width") {
-            metrics_ptr->video_width = value;
-        } else if (key == "video_height") {
-            metrics_ptr->video_height = value;
-        }
+        if (key == "frames_published") metrics->frames_published = value;
+        else if (key == "total_frames") metrics->total_frames = value;
+        else if (key == "errors") metrics->errors = value;
+        else if (key == "video_width") metrics->video_width = value;
+        else if (key == "video_height") metrics->video_height = value;
 
-        // Update synchronization fields
-        metrics_ptr->last_update_time = time(nullptr);
-        __sync_fetch_and_add(&metrics_ptr->update_counter, 1);
+        metrics->last_update_time = time(nullptr);
     }
 
     void updateMetric(const std::string& key, double value) {
-        if (!metrics_ptr) return;
+        if (!metrics) return;
 
-        if (key == "current_fps") {
-            metrics_ptr->current_fps = value;
-        } else if (key == "video_fps") {
-            metrics_ptr->video_fps = value;
-        }
+        if (key == "current_fps") metrics->current_fps = value;
+        else if (key == "video_fps") metrics->video_fps = value;
 
-        // Update synchronization fields
-        metrics_ptr->last_update_time = time(nullptr);
-        __sync_fetch_and_add(&metrics_ptr->update_counter, 1);
+        metrics->last_update_time = time(nullptr);
     }
 
-    /**
-     * Get current metrics snapshot for benchmark storage
-     */
-    SharedMetrics getMetricsSnapshot() const {
-        if (!metrics_ptr) {
-            return SharedMetrics{};
+    void updateVideoPath(const std::string& path) {
+        if (metrics) {
+            strncpy(metrics->video_path, path.c_str(), 255);
         }
-        return *metrics_ptr;
     }
 
-    ~SharedMemoryManager() {
-        if (metrics_ptr && metrics_ptr != MAP_FAILED) {
-            munmap(metrics_ptr, SHM_SIZE);
+    // Return by reference to avoid copying atomics
+    const PublisherSharedMetrics& getMetricsSnapshot() const {
+        if (!metrics) {
+            throw std::runtime_error("Shared memory not initialized");
         }
+        return *metrics;
+    }
 
+    ~PublisherSharedMemoryManager() {
+        if (metrics && metrics != MAP_FAILED) {
+            munmap(metrics, sizeof(PublisherSharedMetrics));
+        }
         if (shm_fd != -1) {
             close(shm_fd);
         }
-
-        // Only unlink if we created the segment and we're shutting down cleanly
-        if (is_owner && !g_running) {
-            shm_unlink(SHM_NAME);
-            std::cout << "[SHM] Cleaned up shared memory segment\n";
+        if (is_owner) {
+            shm_unlink("/mp4_frame_publisher_metrics");
         }
     }
 };
 
-/**
- * SQLite Benchmark Database Manager
- * Handles periodic storage of performance benchmarks and historical data
- * Uses in-memory database for speed while maintaining persistence through dumps
- */
-class BenchmarkDatabase {
-private:
-    sqlite3* db;
-    std::mutex db_mutex;  // Protect database operations
-    std::string service_name;
+class PublisherBenchmarkDatabase {
+    sqlite3* db = nullptr;
+    std::mutex db_mutex;
+    std::atomic<bool> export_in_progress{false};
+    std::thread export_thread;
 
-    /**
-     * Initialize database schema for benchmark storage
-     */
-    bool initializeSchema() {
-        const char* create_table_sql = R"(
-            CREATE TABLE IF NOT EXISTS performance_benchmarks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp INTEGER NOT NULL,
-                service_name TEXT NOT NULL,
+    void initializeSchema() {
+        const char* sql = R"(
+            BEGIN TRANSACTION;
+            CREATE TABLE IF NOT EXISTS publisher_benchmarks (
+                timestamp INTEGER PRIMARY KEY,
                 frames_published INTEGER,
                 total_frames INTEGER,
                 current_fps REAL,
                 video_fps REAL,
                 errors INTEGER,
                 uptime_seconds INTEGER,
-                memory_usage_kb INTEGER,
-                cpu_usage_percent REAL
+                memory_usage_kb INTEGER
             );
-
-            CREATE INDEX IF NOT EXISTS idx_timestamp ON performance_benchmarks(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_service ON performance_benchmarks(service_name);
+            CREATE INDEX IF NOT EXISTS idx_timestamp ON publisher_benchmarks(timestamp);
+            COMMIT;
         )";
 
-        char* error_msg = nullptr;
-        int result = sqlite3_exec(db, create_table_sql, nullptr, nullptr, &error_msg);
-
-        if (result != SQLITE_OK) {
-            std::cerr << "[SQLite] Failed to create schema: " << error_msg << std::endl;
-            sqlite3_free(error_msg);
-            return false;
+        char* err_msg = nullptr;
+        if (sqlite3_exec(db, sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+            std::string error = err_msg ? err_msg : "Unknown error";
+            sqlite3_free(err_msg);
+            throw std::runtime_error("Schema initialization failed: " + error);
         }
-
-        std::cout << "[SQLite] Database schema initialized\n";
-        return true;
     }
 
-    /**
-     * Get current process memory usage in KB
-     */
     long getMemoryUsage() const {
         std::ifstream status_file("/proc/self/status");
         std::string line;
@@ -263,192 +183,106 @@ private:
                 return std::stol(value);
             }
         }
-        return -1;  // Unable to determine
-    }
-
-    /**
-     * Get current process CPU usage percentage (simplified)
-     */
-    double getCpuUsage() const {
-        // For embedded systems, we'll use a simple approach
-        // In production, you might want to implement more sophisticated CPU monitoring
-        static auto last_time = steady_clock::now();
-        static clock_t last_cpu = clock();
-
-        auto current_time = steady_clock::now();
-        clock_t current_cpu = clock();
-
-        double time_diff = duration<double>(current_time - last_time).count();
-        double cpu_diff = static_cast<double>(current_cpu - last_cpu) / CLOCKS_PER_SEC;
-
-        last_time = current_time;
-        last_cpu = current_cpu;
-
-        return (time_diff > 0) ? (cpu_diff / time_diff) * 100.0 : 0.0;
+        return -1;
     }
 
 public:
-    BenchmarkDatabase(const std::string& name) : db(nullptr), service_name(name) {
-        // Open in-memory database for maximum performance
-        // Data will be periodically dumped to persistent storage if needed
-        int result = sqlite3_open(":memory:", &db);
-
-        if (result != SQLITE_OK) {
-            std::cerr << "[SQLite] Failed to open database: " << sqlite3_errmsg(db) << std::endl;
-            db = nullptr;
-            return;
+    PublisherBenchmarkDatabase() {
+        if (sqlite3_open(":memory:", &db) != SQLITE_OK) {
+            throw std::runtime_error("Failed to open in-memory database: " + std::string(sqlite3_errmsg(db)));
         }
 
-        // Configure SQLite for optimal performance in embedded environment
+        // Configure for performance
         sqlite3_exec(db, "PRAGMA synchronous = OFF", nullptr, nullptr, nullptr);
         sqlite3_exec(db, "PRAGMA journal_mode = MEMORY", nullptr, nullptr, nullptr);
         sqlite3_exec(db, "PRAGMA temp_store = MEMORY", nullptr, nullptr, nullptr);
-        sqlite3_exec(db, "PRAGMA cache_size = 10000", nullptr, nullptr, nullptr);
 
-        if (!initializeSchema()) {
-            sqlite3_close(db);
-            db = nullptr;
-        } else {
-            std::cout << "[SQLite] In-memory benchmark database initialized\n";
-        }
+        initializeSchema();
     }
 
-    /**
-     * Store a benchmark snapshot with comprehensive system metrics
-     */
-    void storeBenchmark(const SharedMetrics& metrics) {
-        if (!db) return;
-
+    void storeBenchmark(const PublisherSharedMetrics& metrics) {
         std::lock_guard<std::mutex> lock(db_mutex);
 
-        const char* insert_sql = R"(
-            INSERT INTO performance_benchmarks
-            (timestamp, service_name, frames_published, total_frames, current_fps,
-             video_fps, errors, uptime_seconds, memory_usage_kb, cpu_usage_percent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        sqlite3_exec(db, "BEGIN TRANSACTION", nullptr, nullptr, nullptr);
+
+        const char* sql = R"(
+            INSERT INTO publisher_benchmarks
+            (timestamp, frames_published, total_frames, current_fps, video_fps, errors, uptime_seconds, memory_usage_kb)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         )";
 
         sqlite3_stmt* stmt;
-        int result = sqlite3_prepare_v2(db, insert_sql, -1, &stmt, nullptr);
-
-        if (result != SQLITE_OK) {
-            std::cerr << "[SQLite] Failed to prepare statement: " << sqlite3_errmsg(db) << std::endl;
-            return;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            throw std::runtime_error("Failed to prepare statement: " + std::string(sqlite3_errmsg(db)));
         }
 
-        // Calculate uptime
-        time_t current_time = time(nullptr);
-        int uptime = static_cast<int>(current_time - metrics.service_start_time);
+        try {
+            time_t current_time = time(nullptr);
+            int uptime = static_cast<int>(current_time - metrics.service_start_time);
 
-        // Bind parameters
-        sqlite3_bind_int64(stmt, 1, current_time);
-        sqlite3_bind_text(stmt, 2, service_name.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt, 3, metrics.frames_published);
-        sqlite3_bind_int(stmt, 4, metrics.total_frames);
-        sqlite3_bind_double(stmt, 5, metrics.current_fps);
-        sqlite3_bind_double(stmt, 6, metrics.video_fps);
-        sqlite3_bind_int(stmt, 7, metrics.errors);
-        sqlite3_bind_int(stmt, 8, uptime);
-        sqlite3_bind_int64(stmt, 9, getMemoryUsage());
-        sqlite3_bind_double(stmt, 10, getCpuUsage());
+            sqlite3_bind_int64(stmt, 1, current_time);
+            sqlite3_bind_int(stmt, 2, metrics.frames_published.load());
+            sqlite3_bind_int(stmt, 3, metrics.total_frames.load());
+            sqlite3_bind_double(stmt, 4, metrics.current_fps.load());
+            sqlite3_bind_double(stmt, 5, metrics.video_fps.load());
+            sqlite3_bind_int(stmt, 6, metrics.errors.load());
+            sqlite3_bind_int(stmt, 7, uptime);
+            sqlite3_bind_int64(stmt, 8, getMemoryUsage());
 
-        result = sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
+            if (sqlite3_step(stmt) != SQLITE_DONE) {
+                throw std::runtime_error("Insert failed: " + std::string(sqlite3_errmsg(db)));
+            }
 
-        if (result != SQLITE_DONE) {
-            std::cerr << "[SQLite] Failed to insert benchmark: " << sqlite3_errmsg(db) << std::endl;
+            sqlite3_finalize(stmt);
+            sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+        } catch (...) {
+            sqlite3_finalize(stmt);
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            throw;
         }
     }
 
-    /**
-     * Export benchmark data to persistent storage (optional)
-     * This can be called periodically or on shutdown to preserve historical data
-     */
-    void exportToFile(const std::string& filepath) {
-        if (!db) return;
+    void asyncExport(const std::string& path) {
+        if (export_in_progress.load()) return;
 
-        std::lock_guard<std::mutex> lock(db_mutex);
+        export_in_progress = true;
 
-        // Open file database for export
-        sqlite3* file_db;
-        int result = sqlite3_open(filepath.c_str(), &file_db);
-
-        if (result != SQLITE_OK) {
-            std::cerr << "[SQLite] Failed to open export file: " << sqlite3_errmsg(file_db) << std::endl;
-            return;
+        if (export_thread.joinable()) {
+            export_thread.join();
         }
 
-        // Use SQLite backup API to copy in-memory database to file
-        sqlite3_backup* backup = sqlite3_backup_init(file_db, "main", db, "main");
+        export_thread = std::thread([this, path]() {
+            try {
+                std::lock_guard<std::mutex> lock(db_mutex);
 
-        if (backup) {
-            sqlite3_backup_step(backup, -1);
-            sqlite3_backup_finish(backup);
-            std::cout << "[SQLite] Benchmark data exported to " << filepath << std::endl;
-        } else {
-            std::cerr << "[SQLite] Failed to initialize backup\n";
-        }
+                sqlite3* file_db;
+                if (sqlite3_open(path.c_str(), &file_db) != SQLITE_OK) {
+                    throw std::runtime_error("Failed to open export database: " + std::string(sqlite3_errmsg(file_db)));
+                }
 
-        sqlite3_close(file_db);
+                sqlite3_backup* backup = sqlite3_backup_init(file_db, "main", db, "main");
+                if (!backup) {
+                    sqlite3_close(file_db);
+                    throw std::runtime_error("Backup initialization failed");
+                }
+
+                sqlite3_backup_step(backup, -1); // Copy entire database
+                sqlite3_backup_finish(backup);
+                sqlite3_close(file_db);
+            } catch (const std::exception& e) {
+                std::cerr << "Export failed: " << e.what() << std::endl;
+            }
+            export_in_progress = false;
+        });
     }
 
-    /**
-     * Get recent performance statistics for monitoring
-     */
-    void printRecentStats(int last_n_records = 10) {
-        if (!db) return;
-
-        std::lock_guard<std::mutex> lock(db_mutex);
-
-        const char* query_sql = R"(
-            SELECT timestamp, frames_published, current_fps, errors, memory_usage_kb, cpu_usage_percent
-            FROM performance_benchmarks
-            WHERE service_name = ?
-            ORDER BY timestamp DESC
-            LIMIT ?
-        )";
-
-        sqlite3_stmt* stmt;
-        int result = sqlite3_prepare_v2(db, query_sql, -1, &stmt, nullptr);
-
-        if (result != SQLITE_OK) {
-            std::cerr << "[SQLite] Failed to prepare query: " << sqlite3_errmsg(db) << std::endl;
-            return;
+    ~PublisherBenchmarkDatabase() {
+        if (export_thread.joinable()) {
+            export_thread.join();
         }
-
-        sqlite3_bind_text(stmt, 1, service_name.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt, 2, last_n_records);
-
-        std::cout << "[Benchmark] Recent performance data:\n";
-        std::cout << "Timestamp\t\tFrames\tFPS\tErrors\tMem(KB)\tCPU%\n";
-        std::cout << "--------------------------------------------------------\n";
-
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            time_t timestamp = sqlite3_column_int64(stmt, 0);
-            int frames = sqlite3_column_int(stmt, 1);
-            double fps = sqlite3_column_double(stmt, 2);
-            int errors = sqlite3_column_int(stmt, 3);
-            long memory = sqlite3_column_int64(stmt, 4);
-            double cpu = sqlite3_column_double(stmt, 5);
-
-            char time_str[32];
-            strftime(time_str, sizeof(time_str), "%H:%M:%S", localtime(&timestamp));
-
-            std::cout << time_str << "\t\t" << frames << "\t"
-                      << std::fixed << std::setprecision(1) << fps << "\t"
-                      << errors << "\t" << memory << "\t"
-                      << std::setprecision(1) << cpu << "\n";
-        }
-
-        sqlite3_finalize(stmt);
-    }
-
-    ~BenchmarkDatabase() {
         if (db) {
-            // Optionally export data before closing
-            // exportToFile("/tmp/frame_publisher_benchmarks.db");
             sqlite3_close(db);
-            std::cout << "[SQLite] Database closed\n";
         }
     }
 };
@@ -462,28 +296,24 @@ private:
     zmq::socket_t zmq_socket;
     cv::VideoCapture video_cap;
 
-    // Replace Redis with shared memory and SQLite
-    std::unique_ptr<SharedMemoryManager> shm_manager;
-    std::unique_ptr<BenchmarkDatabase> benchmark_db;
+    std::unique_ptr<PublisherSharedMemoryManager> shm;
+    std::unique_ptr<PublisherBenchmarkDatabase> db;
 
     json config;
+    std::atomic<bool> running{true};
 
-    // Metrics
     int frames_published = 0;
     int errors = 0;
     steady_clock::time_point start_time;
-    steady_clock::time_point last_benchmark_time;
 
     void loadConfig() {
-        // Default configuration
         config = {
             {"video_input_path", DEFAULT_VIDEO_PATH},
             {"publish_port", 5555},
-            {"benchmark_db_path", "/tmp/frame_publisher_benchmarks.db"},
-            {"benchmark_export_interval", 100}  // Export every 100 frames
+            {"benchmark_db_path", "/var/log/jvideo/frame_publisher_benchmarks.db"},
+            {"benchmark_export_interval", 100}
         };
 
-        // Try to load from config file
         std::string config_path = DEFAULT_CONFIG_PATH;
         const char* env_path = std::getenv("FRAME_PUBLISHER_CONFIG");
         if (env_path) {
@@ -496,7 +326,6 @@ private:
                 json user_config;
                 config_file >> user_config;
 
-                // Only merge the keys we care about
                 if (user_config.contains("video_input_path")) {
                     config["video_input_path"] = user_config["video_input_path"];
                 }
@@ -519,39 +348,28 @@ private:
     }
 
 public:
-    MP4FramePublisher()
-        : zmq_context(1),
-          zmq_socket(zmq_context, ZMQ_PUB) {
-
+    MP4FramePublisher() : zmq_context(1), zmq_socket(zmq_context, ZMQ_PUB) {
         start_time = steady_clock::now();
-        last_benchmark_time = start_time;
 
-        // Initialize shared memory and benchmark database
-        shm_manager = std::make_unique<SharedMemoryManager>("mp4-frame-publisher");
-        benchmark_db = std::make_unique<BenchmarkDatabase>("mp4-frame-publisher");
+        shm = std::make_unique<PublisherSharedMemoryManager>("mp4-frame-publisher");
+        db = std::make_unique<PublisherBenchmarkDatabase>();
 
-        // Load configuration
         loadConfig();
 
-        // Setup ZMQ socket options
         zmq_socket.set(zmq::sockopt::sndhwm, 10);
 
-        // Setup signal handlers
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
 
-        // Bind ZMQ socket with configured port
         int port = config["publish_port"];
         std::string bind_addr = "tcp://*:" + std::to_string(port);
         zmq_socket.bind(bind_addr);
         std::cout << "[Publisher] ZMQ socket bound to " << bind_addr << std::endl;
 
-        // Give subscribers time to connect
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
     bool openVideo(const std::string& video_path = "") {
-        // Determine video path: command line > config file > default
         std::string final_path;
         if (!video_path.empty()) {
             final_path = video_path;
@@ -561,16 +379,13 @@ public:
             std::cout << "[Publisher] Using configured path: " << final_path << std::endl;
         }
 
-        // Debug: Check file accessibility
         std::ifstream test_file(final_path);
         if (!test_file.good()) {
             std::cerr << "[Publisher] File not accessible: " << final_path << std::endl;
             return false;
         }
         test_file.close();
-        std::cout << "[Publisher] File is accessible" << std::endl;
 
-        // Try different backends (compatible with older OpenCV versions)
         std::vector<std::pair<int, std::string>> backends_to_try = {
             {cv::CAP_ANY, "CAP_ANY"},
             {cv::CAP_FFMPEG, "CAP_FFMPEG"},
@@ -587,7 +402,6 @@ public:
             if (video_cap.open(final_path, backend)) {
                 std::cout << "[Publisher] Successfully opened with backend: " << backend_name << std::endl;
 
-                // Get video properties
                 int frame_count = static_cast<int>(video_cap.get(cv::CAP_PROP_FRAME_COUNT));
                 double fps = video_cap.get(cv::CAP_PROP_FPS);
                 int width = static_cast<int>(video_cap.get(cv::CAP_PROP_FRAME_WIDTH));
@@ -596,11 +410,11 @@ public:
                 std::cout << "[Publisher] Video opened: " << width << "x" << height
                         << ", " << frame_count << " frames @ " << fps << " fps\n";
 
-                // Store video info in shared memory
-                shm_manager->updateMetric("total_frames", frame_count);
-                shm_manager->updateMetric("video_fps", fps);
-                shm_manager->updateMetric("video_width", width);
-                shm_manager->updateMetric("video_height", height);
+                shm->updateMetric("total_frames", frame_count);
+                shm->updateMetric("video_fps", fps);
+                shm->updateMetric("video_width", width);
+                shm->updateMetric("video_height", height);
+                shm->updateVideoPath(final_path);
 
                 return true;
             } else {
@@ -612,7 +426,7 @@ public:
         return false;
     }
 
-    void publishFrames() {
+    void run() {
         if (!video_cap.isOpened()) {
             std::cerr << "[Publisher] Video not opened\n";
             return;
@@ -624,14 +438,13 @@ public:
 
         std::cout << "[Publisher] Starting frame publishing...\n";
 
-        while (g_running && video_cap.read(frame)) {
+        while (g_running && running && video_cap.read(frame)) {
             if (frame.empty()) {
                 std::cout << "[Publisher] Empty frame, skipping\n";
                 continue;
             }
 
             try {
-                // Create metadata
                 json metadata;
                 metadata["frame_id"] = frame_id;
                 metadata["timestamp"] = duration<double>(steady_clock::now().time_since_epoch()).count();
@@ -640,12 +453,10 @@ public:
                 metadata["channels"] = frame.channels();
                 metadata["source"] = "mp4";
 
-                // Send metadata first
                 std::string meta_str = metadata.dump();
                 zmq::message_t meta_msg(meta_str.data(), meta_str.size());
                 zmq_socket.send(meta_msg, zmq::send_flags::sndmore);
 
-                // Send frame data
                 size_t frame_size = frame.total() * frame.elemSize();
                 zmq::message_t frame_msg(frame_size);
                 std::memcpy(frame_msg.data(), frame.data, frame_size);
@@ -654,80 +465,68 @@ public:
                 frames_published++;
                 frame_id++;
 
-                // Update real-time metrics in shared memory every 10 frames (very frequent)
+                // Update metrics every 10 frames
                 if (frames_published % 10 == 0) {
                     auto now = steady_clock::now();
                     double elapsed = duration<double>(now - start_time).count();
                     double fps = frames_published / elapsed;
 
-                    shm_manager->updateMetric("frames_published", frames_published);
-                    shm_manager->updateMetric("current_fps", fps);
-                    shm_manager->updateMetric("errors", errors);
+                    shm->updateMetric("frames_published", frames_published);
+                    shm->updateMetric("current_fps", fps);
+                    shm->updateMetric("errors", errors);
                 }
 
-                // Store benchmark data every 1000 frames (less frequent, more comprehensive)
+                // Store benchmark every 1000 frames
                 if (frames_published % 1000 == 0) {
-                    auto metrics_snapshot = shm_manager->getMetricsSnapshot();
-                    benchmark_db->storeBenchmark(metrics_snapshot);
+                    auto& metrics_snapshot = shm->getMetricsSnapshot();
+                    db->storeBenchmark(metrics_snapshot);
 
                     std::cout << "[Publisher] Published " << frames_published
                               << " frames, FPS: " << std::fixed << std::setprecision(1)
                               << metrics_snapshot.current_fps << "\n";
                 }
 
-                // Export to persistent DB file periodically
+                // Export periodically
                 if (frames_published % export_interval == 0) {
-                    std::string db_path = config["benchmark_db_path"];
-                    benchmark_db->exportToFile(db_path);
-                    std::cout << "[Publisher] Exported benchmark data to " << db_path << std::endl;
+                    db->asyncExport(config["benchmark_db_path"]);
                 }
 
-                // Print recent benchmark stats every 5000 frames
-                if (frames_published % 5000 == 0) {
-                    benchmark_db->printRecentStats(5);
-                }
-
-                // Small delay to prevent overwhelming subscribers
-                std::this_thread::sleep_for(std::chrono::milliseconds(33)); // ~30 fps
+                std::this_thread::sleep_for(std::chrono::milliseconds(33));
 
             } catch (const zmq::error_t& e) {
                 std::cerr << "[Publisher] ZMQ error: " << e.what() << std::endl;
                 errors++;
-                shm_manager->updateMetric("errors", errors);
+                shm->updateMetric("errors", errors);
             } catch (const std::exception& e) {
                 std::cerr << "[Publisher] Error: " << e.what() << std::endl;
                 errors++;
-                shm_manager->updateMetric("errors", errors);
+                shm->updateMetric("errors", errors);
             }
         }
 
-        // Final metrics update and benchmark storage
+        // Final updates
+        shm->updateMetric("frames_published", frames_published);
+        shm->updateMetric("errors", errors);
+
+        auto& final_metrics = shm->getMetricsSnapshot();
+        db->storeBenchmark(final_metrics);
+        db->asyncExport(config["benchmark_db_path"]);
+
         auto total_time = duration<double>(steady_clock::now() - start_time).count();
-        shm_manager->updateMetric("frames_published", frames_published);
-        shm_manager->updateMetric("errors", errors);
-
-        // Store final benchmark
-        auto final_metrics = shm_manager->getMetricsSnapshot();
-        benchmark_db->storeBenchmark(final_metrics);
-
-        // Final export to persistent storage
-        std::string db_path = config["benchmark_db_path"];
-        benchmark_db->exportToFile(db_path);
-        std::cout << "[Publisher] Final export to " << db_path << std::endl;
-
-        // Print final statistics
         std::cout << "[Publisher] Finished. Published " << frames_published
                   << " frames in " << std::fixed << std::setprecision(1) << total_time << " seconds\n";
+    }
 
-        benchmark_db->printRecentStats(10);
+    void stop() {
+        running = false;
     }
 
     ~MP4FramePublisher() {
         if (video_cap.isOpened()) {
             video_cap.release();
         }
-        if (benchmark_db) {
-            benchmark_db->exportToFile(config["benchmark_db_path"]);
+        if (db) {
+            db->asyncExport(config["benchmark_db_path"]);
         }
     }
 };
@@ -738,7 +537,6 @@ int main(int argc, char* argv[]) {
     try {
         MP4FramePublisher publisher;
 
-        // Use command line argument for video path if provided
         std::string video_path = (argc > 1) ? argv[1] : "";
 
         if (!publisher.openVideo(video_path)) {
@@ -746,7 +544,18 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        publisher.publishFrames();
+        std::thread publisher_thread([&publisher]() {
+            publisher.run();
+        });
+
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        publisher.stop();
+        if (publisher_thread.joinable()) {
+            publisher_thread.join();
+        }
 
     } catch (const std::exception& e) {
         std::cerr << "[Publisher] Fatal error: " << e.what() << std::endl;
