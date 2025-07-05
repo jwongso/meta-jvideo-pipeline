@@ -1,5 +1,5 @@
 SUMMARY = "Juni's Video Pipeline Services"
-DESCRIPTION = "Video processing microservices using ZeroMQ and Redis - Python, C++, and Rust implementations"
+DESCRIPTION = "Video processing microservices using ZeroMQ, SharedMemory and SQLite - Python, C++, and Rust implementations"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
@@ -14,14 +14,13 @@ DEPENDS = " \
     cargo-native \
     rust-native \
     nlohmann-json \
-    hiredis \
+    sqlite3 \
     "
 
-# Runtime dependencies
+# Runtime dependencies - Removed Redis, added SQLite and SHM utils
 RDEPENDS:${PN} = " \
     python3-core \
     python3-pyzmq \
-    python3-redis \
     python3-opencv \
     python3-numpy \
     python3-json \
@@ -30,8 +29,10 @@ RDEPENDS:${PN} = " \
     python3-datetime \
     python3-psutil \
     python3-curses \
+    python3-ctypes \
+    python3-mmap \
     zeromq \
-    redis \
+    sqlite3 \
     opencv \
     bash \
     ffmpeg \
@@ -91,6 +92,8 @@ OECMAKE_BUILDPATH = "${WORKDIR}/build"
 EXTRA_OECMAKE = " \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=/opt/jvideo \
+    -DSQLITE3_INCLUDE_DIRS=${STAGING_INCDIR} \
+    -DSQLITE3_LIBRARIES=${STAGING_LIBDIR}/libsqlite3.so \
     "
 
 # Custom Rust compilation (same as before)
@@ -179,13 +182,16 @@ do_install() {
     install -d ${D}/etc/jvideo
     install -d ${D}/var/lib/jvideo
     install -d ${D}/var/lib/jvideo/frames
+    install -d ${D}/var/lib/jvideo/db
     install -d ${D}/usr/bin
 
-    # Create tmpfiles.d configuration for /var/log/jvideo
+    # Create tmpfiles.d configuration for directories and shared memory
     install -d ${D}${sysconfdir}/tmpfiles.d
     echo "d /var/log/jvideo 0755 root root -" > ${D}${sysconfdir}/tmpfiles.d/jvideo.conf
     echo "d /var/lib/jvideo 0755 root root -" >> ${D}${sysconfdir}/tmpfiles.d/jvideo.conf
     echo "d /var/lib/jvideo/frames 0755 root root -" >> ${D}${sysconfdir}/tmpfiles.d/jvideo.conf
+    echo "d /var/lib/jvideo/db 0755 root root -" >> ${D}${sysconfdir}/tmpfiles.d/jvideo.conf
+    echo "d /dev/shm/jvideo 0755 root root -" >> ${D}${sysconfdir}/tmpfiles.d/jvideo.conf
 
     # Install Python services - Added queue_monitor.py
     install -m 0755 ${S}/service_base.py ${D}/opt/jvideo/services/
@@ -256,6 +262,27 @@ do_install() {
     echo '#!/bin/bash' > ${D}/usr/bin/jvideo-dashboard
     echo 'exec /usr/bin/python3 /opt/jvideo/services/queue_monitor.py "$@"' >> ${D}/usr/bin/jvideo-dashboard
     chmod 0755 ${D}/usr/bin/jvideo-dashboard
+
+    # Initialize SQLite database
+    echo '#!/bin/bash' > ${D}/usr/bin/jvideo-init-db
+    echo 'sqlite3 /var/lib/jvideo/db/jvideo.db << EOF' >> ${D}/usr/bin/jvideo-init-db
+    echo 'CREATE TABLE IF NOT EXISTS queue_stats (' >> ${D}/usr/bin/jvideo-init-db
+    echo '    id INTEGER PRIMARY KEY AUTOINCREMENT,' >> ${D}/usr/bin/jvideo-init-db
+    echo '    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,' >> ${D}/usr/bin/jvideo-init-db
+    echo '    queue_name TEXT NOT NULL,' >> ${D}/usr/bin/jvideo-init-db
+    echo '    queue_size INTEGER,' >> ${D}/usr/bin/jvideo-init-db
+    echo '    messages_per_second REAL,' >> ${D}/usr/bin/jvideo-init-db
+    echo '    service_status TEXT' >> ${D}/usr/bin/jvideo-init-db
+    echo ');' >> ${D}/usr/bin/jvideo-init-db
+    echo 'CREATE TABLE IF NOT EXISTS frame_stats (' >> ${D}/usr/bin/jvideo-init-db
+    echo '    id INTEGER PRIMARY KEY AUTOINCREMENT,' >> ${D}/usr/bin/jvideo-init-db
+    echo '    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,' >> ${D}/usr/bin/jvideo-init-db
+    echo '    frame_count INTEGER,' >> ${D}/usr/bin/jvideo-init-db
+    echo '    frames_per_second REAL,' >> ${D}/usr/bin/jvideo-init-db
+    echo '    processing_time_ms REAL' >> ${D}/usr/bin/jvideo-init-db
+    echo ');' >> ${D}/usr/bin/jvideo-init-db
+    echo 'EOF' >> ${D}/usr/bin/jvideo-init-db
+    chmod 0755 ${D}/usr/bin/jvideo-init-db
 }
 
 FILES:${PN} += " \
@@ -264,6 +291,7 @@ FILES:${PN} += " \
     /var/lib/jvideo \
     /usr/bin/jvideo-control \
     /usr/bin/jvideo-dashboard \
+    /usr/bin/jvideo-init-db \
     ${sysconfdir}/tmpfiles.d/jvideo.conf \
     "
 

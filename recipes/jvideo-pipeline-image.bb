@@ -10,14 +10,8 @@ IMAGE_FEATURES += "ssh-server-openssh"
 # Add development/debugging tools
 EXTRA_IMAGE_FEATURES += "debug-tweaks tools-debug"
 
-DISTRO_FEATURES:append = " systemd"
-DISTRO_FEATURES_BACKFILL_CONSIDERED += "sysvinit"
-
-# Use systemd as init manager
-VIRTUAL-RUNTIME_init_manager = "systemd"
-VIRTUAL-RUNTIME_initscripts = "systemd-compat-units"
-
-QB_MEM = "-m 512"
+# QEMU memory settings - moved from local.conf
+QB_MEM = "-m 1024"
 
 # Install systemd
 IMAGE_INSTALL += " \
@@ -31,23 +25,31 @@ IMAGE_INSTALL += " \
     jvideo-services \
     "
 
-# Add useful system tools
+# Add useful system tools - Removed Redis, added SQLite
 IMAGE_INSTALL += " \
     htop \
     vim \
     nano \
     python3 \
     python3-psutil \
-    redis \
+    sqlite3 \
+    gstreamer1.0 \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
     "
 
+# FFmpeg and video libraries
 IMAGE_INSTALL += " \
     ffmpeg \
     libavcodec \
     libavformat \
     libavutil \
-"
+    "
 
+# Content package
 IMAGE_INSTALL += "jvideo-content"
 
 # Increase root filesystem size (in KB)
@@ -102,18 +104,15 @@ enable_jvideo_services() {
     # Create systemd autostart script
     install -d ${IMAGE_ROOTFS}/etc/systemd/system/multi-user.target.wants/
 
-    # Enable Redis service
-    ln -sf /lib/systemd/system/redis-server.service ${IMAGE_ROOTFS}/etc/systemd/system/multi-user.target.wants/redis-server.service
-
-    # Create a service to apply configuration and start pipeline
+    # Create a service to initialize database and start pipeline
     cat > ${IMAGE_ROOTFS}/etc/systemd/system/jvideo-pipeline.service << 'EOF'
 [Unit]
 Description=Juni's Video Pipeline Autostart
-After=network.target redis-server.service
-Wants=redis-server.service
+After=network.target
 
 [Service]
 Type=oneshot
+ExecStartPre=/usr/bin/jvideo-init-db
 ExecStart=/usr/bin/jvideo-control apply /etc/jvideo/services.conf
 RemainAfterExit=true
 StandardOutput=journal
@@ -126,7 +125,7 @@ EOF
     # Enable the autostart service
     ln -sf /etc/systemd/system/jvideo-pipeline.service ${IMAGE_ROOTFS}/etc/systemd/system/multi-user.target.wants/jvideo-pipeline.service
 
-    # Create startup script for manual control - Updated with dashboard
+    # Create startup script for manual control - Updated with database info
     cat > ${IMAGE_ROOTFS}/etc/profile.d/jvideo-welcome.sh << 'EOF'
 #!/bin/sh
 echo ""
@@ -139,9 +138,12 @@ echo "  jvideo-control start <svc>  - Start a service"
 echo "  jvideo-control stop <svc>   - Stop a service"
 echo "  jvideo-control apply        - Apply configuration"
 echo "  jvideo-dashboard            - Open monitoring dashboard"
+echo "  jvideo-init-db              - Initialize SQLite database"
 echo ""
 echo "Available services: frame-publisher, frame-resizer, frame-saver, queue-monitor"
 echo "Saved frames: /var/lib/jvideo/frames/"
+echo "Database: /var/lib/jvideo/db/jvideo.db"
+echo "Shared memory: /dev/shm/jvideo/"
 echo "=========================================================="
 echo ""
 EOF
