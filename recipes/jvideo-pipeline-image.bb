@@ -98,6 +98,15 @@ configure_jvideo() {
     # Create output directory
     install -d ${IMAGE_ROOTFS}/var/lib/jvideo/frames
     chmod 755 ${IMAGE_ROOTFS}/var/lib/jvideo/frames
+
+    # Create mount point for host share
+    install -d ${IMAGE_ROOTFS}/mnt/host
+
+    # Add to fstab for automatic mounting
+    echo "hostshare /mnt/host 9p trans=virtio,version=9p2000.L,rw,noauto 0 0" >> ${IMAGE_ROOTFS}/etc/fstab
+
+    # Create a symlink for convenience
+    ln -sf /mnt/host/frames ${IMAGE_ROOTFS}/var/lib/jvideo/frames-host
 }
 
 enable_jvideo_services() {
@@ -112,7 +121,6 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStartPre=/usr/bin/jvideo-init-db
 ExecStart=/usr/bin/jvideo-control apply /etc/jvideo/services.conf
 RemainAfterExit=true
 StandardOutput=journal
@@ -138,11 +146,10 @@ echo "  jvideo-control start <svc>  - Start a service"
 echo "  jvideo-control stop <svc>   - Stop a service"
 echo "  jvideo-control apply        - Apply configuration"
 echo "  jvideo-dashboard            - Open monitoring dashboard"
-echo "  jvideo-init-db              - Initialize SQLite database"
 echo ""
 echo "Available services: frame-publisher, frame-resizer, frame-saver, queue-monitor"
 echo "Saved frames: /var/lib/jvideo/frames/"
-echo "Database: /var/lib/jvideo/db/jvideo.db"
+echo "Database: /var/log/jvideo/frame_*_benchmarks.db"
 echo "Shared memory: /dev/shm/jvideo/"
 echo "=========================================================="
 echo ""

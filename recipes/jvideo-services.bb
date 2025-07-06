@@ -262,27 +262,6 @@ do_install() {
     echo '#!/bin/bash' > ${D}/usr/bin/jvideo-dashboard
     echo 'exec /usr/bin/python3 /opt/jvideo/services/queue_monitor.py "$@"' >> ${D}/usr/bin/jvideo-dashboard
     chmod 0755 ${D}/usr/bin/jvideo-dashboard
-
-    # Initialize SQLite database
-    echo '#!/bin/bash' > ${D}/usr/bin/jvideo-init-db
-    echo 'sqlite3 /var/lib/jvideo/db/jvideo.db << EOF' >> ${D}/usr/bin/jvideo-init-db
-    echo 'CREATE TABLE IF NOT EXISTS queue_stats (' >> ${D}/usr/bin/jvideo-init-db
-    echo '    id INTEGER PRIMARY KEY AUTOINCREMENT,' >> ${D}/usr/bin/jvideo-init-db
-    echo '    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,' >> ${D}/usr/bin/jvideo-init-db
-    echo '    queue_name TEXT NOT NULL,' >> ${D}/usr/bin/jvideo-init-db
-    echo '    queue_size INTEGER,' >> ${D}/usr/bin/jvideo-init-db
-    echo '    messages_per_second REAL,' >> ${D}/usr/bin/jvideo-init-db
-    echo '    service_status TEXT' >> ${D}/usr/bin/jvideo-init-db
-    echo ');' >> ${D}/usr/bin/jvideo-init-db
-    echo 'CREATE TABLE IF NOT EXISTS frame_stats (' >> ${D}/usr/bin/jvideo-init-db
-    echo '    id INTEGER PRIMARY KEY AUTOINCREMENT,' >> ${D}/usr/bin/jvideo-init-db
-    echo '    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,' >> ${D}/usr/bin/jvideo-init-db
-    echo '    frame_count INTEGER,' >> ${D}/usr/bin/jvideo-init-db
-    echo '    frames_per_second REAL,' >> ${D}/usr/bin/jvideo-init-db
-    echo '    processing_time_ms REAL' >> ${D}/usr/bin/jvideo-init-db
-    echo ');' >> ${D}/usr/bin/jvideo-init-db
-    echo 'EOF' >> ${D}/usr/bin/jvideo-init-db
-    chmod 0755 ${D}/usr/bin/jvideo-init-db
 }
 
 FILES:${PN} += " \
@@ -291,7 +270,6 @@ FILES:${PN} += " \
     /var/lib/jvideo \
     /usr/bin/jvideo-control \
     /usr/bin/jvideo-dashboard \
-    /usr/bin/jvideo-init-db \
     ${sysconfdir}/tmpfiles.d/jvideo.conf \
     "
 

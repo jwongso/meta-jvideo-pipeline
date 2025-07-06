@@ -1,373 +1,680 @@
 #!/usr/bin/env python3
-"""Ultra-lightweight Queue Monitor - Yocto optimized"""
+"""Queue Monitor - Reads metrics from C++ services via shared memory and SQLite"""
 
 import sys
 import time
 import os
 import json
+import sqlite3
+import mmap
+import struct
 import signal
 from collections import deque
+from contextlib import contextmanager
 
-sys.path.append('/opt/jvideo/services')
-import zmq
-
-# Try Redis but don't fail if not available
+# Try to import ZMQ
 try:
-    import redis
-    REDIS_AVAILABLE = True
+    import zmq
+    ZMQ_AVAILABLE = True
 except ImportError:
-    REDIS_AVAILABLE = False
+    print("WARNING: ZMQ not available, queue monitoring disabled", file=sys.stderr)
+    ZMQ_AVAILABLE = False
 
-class YoctoQueueMonitor:
-    def __init__(self):
-        self.running = True
-        self.zmq_context = zmq.Context()
-        self.mon_sockets = []
+class SharedMemoryReader:
+    """Read metrics from C++ service shared memory segments"""
 
-        # Use bounded stats to prevent memory growth
-        self.stats = {}
+    def __init__(self, shm_name, struct_format, field_names):
+        self.shm_name = shm_name
+        self.struct_format = struct_format
+        self.field_names = field_names
+        self.struct_size = struct.calcsize(struct_format)
+        self.fd = None
+        self.mm = None
 
-        # CPU tracking for accurate percentage
-        self.last_cpu_times = None
-        self.last_cpu_time = 0
+    def open(self):
+        """Open shared memory segment"""
+        try:
+            # Direct file access to /dev/shm
+            shm_path = f"/dev/shm{self.shm_name}"
+            if not os.path.exists(shm_path):
+                return False
 
-        # Minimal config
-        self.config = {
-            'monitor_ports': [5555, 5556],
-            'update_interval': 5,  # seconds
-            'log_interval': 30,    # seconds
-            'max_json_size': 1024, # 1KB max for JSON messages
-            'stats_window': 100,   # Keep last 100 measurements
+            self.fd = os.open(shm_path, os.O_RDONLY)
+            self.mm = mmap.mmap(self.fd, self.struct_size, access=mmap.ACCESS_READ)
+            return True
+
+        except Exception as e:
+            print(f"ERROR opening {self.shm_name}: {e}", file=sys.stderr)
+            return False
+
+    def read_metrics(self):
+        """Read and parse metrics from shared memory"""
+        if not self.mm:
+            return {}
+
+        try:
+            self.mm.seek(0)
+            data = self.mm.read(self.struct_size)
+            values = struct.unpack(self.struct_format, data)
+
+            metrics = {}
+            for i, field in enumerate(self.field_names):
+                if i < len(values):
+                    value = values[i]
+                    # Decode string fields
+                    if isinstance(value, bytes):
+                        value = value.decode('utf-8', errors='ignore').rstrip('\x00')
+                    metrics[field] = value
+
+            return metrics
+
+        except Exception as e:
+            print(f"ERROR reading {self.shm_name}: {e}", file=sys.stderr)
+            return {}
+
+    def close(self):
+        """Clean up resources"""
+        if self.mm:
+            self.mm.close()
+            self.mm = None
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+class ServiceMetricsCollector:
+    """Collect metrics from all C++ services"""
+
+    def __init__(self, config):
+        self.config = config
+
+        # Service configurations matching C++ structs
+        self.services = {
+            'frame-publisher': {
+                'shm_name': '/jvideo_publisher_metrics',
+                'db_path': config.get('service_db_paths', {}).get(
+                    'frame-publisher',
+                    '/var/lib/jvideo/db/publisher_benchmarks.db'
+                ),
+                # PublisherSharedMetrics structure
+                'struct_format': '64s I QQQ dd ii ? 256s qq 64s',
+                'fields': [
+                    'service_name',      # char[64]
+                    'service_pid',       # pid_t (int)
+                    'frames_published',  # uint64_t
+                    'total_frames',      # uint64_t
+                    'errors',            # uint64_t
+                    'current_fps',       # double
+                    'video_fps',         # double
+                    'video_width',       # int
+                    'video_height',      # int
+                    'video_healthy',     # bool
+                    'video_path',        # char[256]
+                    'last_update_time',  # time_t
+                    'service_start_time',# time_t
+                    '_padding'           # char[64]
+                ]
+            },
+            'frame-resizer': {
+                'shm_name': '/jvideo_resizer_metrics',
+                'db_path': config.get('service_db_paths', {}).get(
+                    'frame-resizer',
+                    '/var/lib/jvideo/db/resizer_benchmarks.db'
+                ),
+                # ResizerSharedMetrics structure
+                'struct_format': '64s I QQQ dd iiii ? qq 64s',
+                'fields': [
+                    'service_name',      # char[64]
+                    'service_pid',       # pid_t
+                    'frames_processed',  # uint64_t
+                    'frames_dropped',    # uint64_t
+                    'errors',            # uint64_t
+                    'current_fps',       # double
+                    'processing_time_ms',# double
+                    'input_width',       # int
+                    'input_height',      # int
+                    'output_width',      # int
+                    'output_height',     # int
+                    'service_healthy',   # bool
+                    'last_update_time',  # time_t
+                    'service_start_time',# time_t
+                    '_padding'           # char[64]
+                ]
+            },
+            'frame-saver': {
+                'shm_name': '/jvideo_saver_metrics',
+                'db_path': config.get('service_db_paths', {}).get(
+                    'frame-saver',
+                    '/var/lib/jvideo/db/saver_benchmarks.db'
+                ),
+                # SaverSharedMetrics structure
+                'struct_format': '64s I QQQQ ddd iii ? 256s 16s qq 64s',
+                'fields': [
+                    'service_name',      # char[64]
+                    'service_pid',       # pid_t
+                    'frames_saved',      # uint64_t
+                    'frames_dropped',    # uint64_t
+                    'errors',            # uint64_t
+                    'io_errors',         # uint64_t
+                    'current_fps',       # double
+                    'save_time_ms',      # double
+                    'disk_usage_mb',     # double
+                    'frame_width',       # int
+                    'frame_height',      # int
+                    'frame_channels',    # int
+                    'disk_healthy',      # bool
+                    'output_dir',        # char[256]
+                    'format',            # char[16]
+                    'last_update_time',  # time_t
+                    'service_start_time',# time_t
+                    '_padding'           # char[64]
+                ]
+            }
         }
 
-        # Load config if exists
+        self.shm_readers = {}
+        self.last_db_read = {}
+        self._db_stats_cache = {}
+
+    def initialize(self):
+        """Initialize all shared memory connections"""
+        for service_name, config in self.services.items():
+            reader = SharedMemoryReader(
+                config['shm_name'],
+                config['struct_format'],
+                config['fields']
+            )
+            if reader.open():
+                self.shm_readers[service_name] = reader
+                print(f"Connected to {service_name} shared memory", file=sys.stderr)
+            else:
+                print(f"WARNING: Could not connect to {service_name} shared memory", file=sys.stderr)
+
+    def get_service_metrics(self):
+        """Collect metrics from all available services"""
+        metrics = {}
+
+        for service_name, reader in self.shm_readers.items():
+            shm_data = reader.read_metrics()
+
+            # Check if service is running
+            pid = shm_data.get('service_pid', 0)
+            is_running = pid > 0 and os.path.exists(f'/proc/{pid}')
+
+            # Calculate uptime
+            uptime = 0
+            if is_running and 'service_start_time' in shm_data:
+                uptime = time.time() - shm_data['service_start_time']
+
+            # Get database stats
+            db_stats = self._get_db_stats(service_name)
+
+            metrics[service_name] = {
+                'status': 'running' if is_running else 'stopped',
+                'pid': pid,
+                'uptime': uptime,
+                **shm_data,
+                **db_stats
+            }
+
+        return metrics
+
+    @contextmanager
+    def _db_connection(self, db_path):
+        """Safe database connection context manager"""
+        conn = None
         try:
-            with open('/etc/jvideo/queue-monitor.conf') as f:
-                config_data = json.load(f)
-                self.config.update(config_data)
-        except (IOError, json.JSONDecodeError):
-            pass
+            if os.path.exists(db_path):
+                conn = sqlite3.connect(db_path, timeout=1.0)
+                conn.row_factory = sqlite3.Row
+                yield conn
+            else:
+                yield None
+        except sqlite3.Error as e:
+            print(f"Database error ({db_path}): {e}", file=sys.stderr)
+            yield None
+        finally:
+            if conn:
+                conn.close()
 
-        # Setup signal handlers
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
+    def _get_db_stats(self, service_name):
+        """Get historical metrics from SQLite database"""
+        config = self.services.get(service_name, {})
+        db_path = config.get('db_path')
 
-        # Setup monitoring
-        self.setup_monitoring()
+        if not db_path or not os.path.exists(db_path):
+            return {'db_status': 'no_file'}
 
-        # Simple logging
-        self.log("Yocto Queue Monitor started")
+        # Check if we should read the database
+        now = time.time()
+        should_read = True
 
-    def log(self, message):
-        """Simple logging to stdout/journal"""
-        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-        print(f"[{timestamp}] {message}", flush=True)
+        if service_name in self.last_db_read:
+            time_since_last_read = now - self.last_db_read[service_name]
+            should_read = time_since_last_read >= self.config.get('db_read_interval', 60)
 
-    def signal_handler(self, signum, frame):
+        # Return cached stats if we shouldn't read yet
+        if not should_read and service_name in self._db_stats_cache:
+            return self._db_stats_cache[service_name]
+
+        # Read the database
+        self.last_db_read[service_name] = now
+        stats = {'db_status': 'ok'}
+
+        with self._db_connection(db_path) as conn:
+            if not conn:
+                return {'db_status': 'unavailable'}
+
+            try:
+                # Query based on service type - matching C++ table names
+                recent_time = int(now - 600)  # Last 10 minutes
+
+                if service_name == 'frame-publisher':
+                    cursor = conn.execute("""
+                        SELECT AVG(current_fps) as avg_fps,
+                               MAX(current_fps) as max_fps,
+                               MIN(current_fps) as min_fps,
+                               COUNT(*) as sample_count,
+                               AVG(memory_usage_kb) as avg_memory_kb,
+                               MAX(errors) as max_errors
+                        FROM publisher_benchmarks
+                        WHERE timestamp > ?
+                    """, (recent_time,))
+
+                elif service_name == 'frame-resizer':
+                    cursor = conn.execute("""
+                        SELECT AVG(current_fps) as avg_fps,
+                               MAX(current_fps) as max_fps,
+                               MIN(current_fps) as min_fps,
+                               AVG(processing_time_ms) as avg_processing_ms,
+                               COUNT(*) as sample_count,
+                               MAX(errors) as max_errors
+                        FROM resizer_benchmarks
+                        WHERE timestamp > ?
+                    """, (recent_time,))
+
+                elif service_name == 'frame-saver':
+                    cursor = conn.execute("""
+                        SELECT AVG(current_fps) as avg_fps,
+                               MAX(current_fps) as max_fps,
+                               MIN(current_fps) as min_fps,
+                               AVG(save_time_ms) as avg_save_ms,
+                               MAX(disk_usage_mb) as max_disk_mb,
+                               COUNT(*) as sample_count,
+                               MAX(io_errors) as max_io_errors
+                        FROM saver_benchmarks
+                        WHERE timestamp > ?
+                    """, (recent_time,))
+
+                row = cursor.fetchone()
+                if row:
+                    for key, value in dict(row).items():
+                        if value is not None:
+                            stats[f'db_{key}'] = value
+
+            except sqlite3.Error as e:
+                stats['db_error'] = str(e)
+                stats['db_status'] = 'error'
+
+        self._db_stats_cache[service_name] = stats
+        return stats
+
+    def cleanup(self):
+        """Clean up all resources"""
+        for reader in self.shm_readers.values():
+            reader.close()
+
+class QueueMonitor:
+    """Main Queue Monitor Application"""
+
+    def __init__(self):
+        self.running = True
+        self.zmq_context = None
+        self.mon_sockets = []
+        self.queue_stats = {}
+        self.stats_counter = 0
+
+        # Default configuration
+        self.config = {
+            'monitor_ports': [5555, 5556],
+            'update_interval': 1,
+            'display_interval': 5,
+            'db_read_interval': 60,
+            'service_db_paths': {
+                'frame-publisher': '/var/log/jvideo/frame_publisher_benchmarks.db',
+                'frame-resizer': '/var/log/jvideo/frame_resizer_benchmarks.db',
+                'frame-saver': '/var/log/jvideo/frame_saver_benchmarks.db'
+            }
+        }
+
+        # Load configuration
+        self._load_config()
+
+        # Initialize components
+        self.metrics_collector = ServiceMetricsCollector(self.config)
+        self._setup_signal_handlers()
+
+        # Initialize ZMQ if available
+        if ZMQ_AVAILABLE:
+            self._setup_zmq_monitoring()
+
+        # Initialize shared memory connections
+        self.metrics_collector.initialize()
+
+        print("[Monitor] Queue Monitor initialized", file=sys.stderr)
+
+    def _load_config(self):
+        """Load configuration from file"""
+        config_path = '/etc/jvideo/queue-monitor.conf'
+        try:
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    user_config = json.load(f)
+                    self.config.update(user_config)
+                    print(f"[Monitor] Loaded config from {config_path}", file=sys.stderr)
+        except Exception as e:
+            print(f"[Monitor] Config error: {e}, using defaults", file=sys.stderr)
+
+    def _setup_signal_handlers(self):
+        """Configure signal handlers for graceful shutdown"""
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
-        self.log(f"Received signal {signum}, shutting down...")
+        print(f"\n[Monitor] Received signal {signum}, shutting down...", file=sys.stderr)
         self.running = False
 
-    def setup_monitoring(self):
-        """Setup ZMQ monitoring sockets"""
+    def _setup_zmq_monitoring(self):
+        """Initialize ZMQ monitoring sockets"""
+        self.zmq_context = zmq.Context()
+
         for port in self.config['monitor_ports']:
             try:
                 socket = self.zmq_context.socket(zmq.SUB)
-                socket.setsockopt(zmq.RCVTIMEO, 50)   # 50ms timeout
-                socket.setsockopt(zmq.RCVHWM, 1)      # Keep only 1 message
-                socket.setsockopt(zmq.LINGER, 0)      # Don't linger on close
-                socket.setsockopt(zmq.SNDHWM, 1)      # Limit send buffer too
+                socket.setsockopt(zmq.RCVTIMEO, 100)
+                socket.setsockopt(zmq.RCVHWM, 10)
+                socket.setsockopt(zmq.LINGER, 0)
                 socket.connect(f"tcp://localhost:{port}")
                 socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
                 self.mon_sockets.append((port, socket))
-
-                # Use bounded deques for latency tracking
-                self.stats[port] = {
+                self.queue_stats[port] = {
                     'messages': 0,
+                    'bytes': 0,
                     'last_seen': 0,
-                    'latencies': deque(maxlen=self.config['stats_window']),
-                    'errors': 0
+                    'errors': 0,
+                    'latencies': deque(maxlen=100)
                 }
 
-                self.log(f"Monitoring port {port}")
+                print(f"[Monitor] Monitoring ZMQ port {port}", file=sys.stderr)
+
             except Exception as e:
-                self.log(f"Failed to monitor port {port}: {e}")
+                print(f"[Monitor] Failed to monitor port {port}: {e}", file=sys.stderr)
 
-    def check_queue(self, port, socket):
-        """Check a single queue for messages"""
-        messages = None
+    def _check_zmq_queue(self, port, socket):
+        """Check a ZMQ queue for messages"""
         try:
-            # Try to receive without blocking
-            messages = socket.recv_multipart(zmq.NOBLOCK, copy=False)
-
-            if len(messages) >= 2:
-                # Validate JSON size before parsing
-                json_bytes = messages[0].bytes
-                if len(json_bytes) > self.config['max_json_size']:
-                    self.stats[port]['errors'] += 1
-                    return
-
-                # Parse metadata safely
-                try:
-                    metadata = json.loads(json_bytes.decode('utf-8'))
-
-                    # Update stats
-                    self.stats[port]['messages'] += 1
-                    self.stats[port]['last_seen'] = time.time()
-
-                    # Calculate latency if timestamp available
-                    if 'timestamp' in metadata and isinstance(metadata['timestamp'], (int, float)):
-                        latency = (time.time() - metadata['timestamp']) * 1000
-                        if 0 <= latency <= 60000:  # Reasonable range: 0-60s
-                            self.stats[port]['latencies'].append(latency)
-
-                except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
-                    self.stats[port]['errors'] += 1
-
-        except zmq.Again:
-            pass  # No message available
-        except Exception as e:
-            self.stats[port]['errors'] += 1
-            if self.stats[port]['errors'] % 100 == 0:  # Log every 100 errors
-                self.log(f"Errors on port {port}: {self.stats[port]['errors']}")
-        finally:
-            # Always clean up messages
+            # Try to receive message parts
+            messages = socket.recv_multipart(zmq.NOBLOCK)
             if messages:
-                for msg in messages:
+                self.queue_stats[port]['messages'] += 1
+                self.queue_stats[port]['bytes'] += sum(len(m) for m in messages)
+                self.queue_stats[port]['last_seen'] = time.time()
+
+                # Try to parse metadata for latency
+                if len(messages) >= 1:
                     try:
-                        msg.close()
+                        metadata = json.loads(messages[0])
+                        if 'timestamp' in metadata:
+                            latency = (time.time() - metadata['timestamp']) * 1000
+                            if 0 <= latency <= 10000:  # Sanity check
+                                self.queue_stats[port]['latencies'].append(latency)
                     except:
                         pass
-                del messages
 
-    def get_service_status(self):
-        """Get basic service status from Redis if available"""
-        if not REDIS_AVAILABLE:
-            return {}
-
-        try:
-            # Use connection pool for efficiency
-            r = redis.Redis(decode_responses=True, socket_connect_timeout=1, socket_timeout=1)
-            status = {}
-
-            services = ['frame-publisher', 'frame-resizer', 'frame-saver']
-
-            # Use pipeline for efficiency
-            pipe = r.pipeline()
-            for service in services:
-                pipe.hget(f"service:{service}", 'status')
-                pipe.hget(f"metrics:{service}", 'fps')
-                pipe.hget(f"metrics:{service}", 'frames_processed')
-
-            results = pipe.execute()
-
-            for i, service in enumerate(services):
-                idx = i * 3
-                status[service] = {
-                    'status': results[idx] or 'unknown',
-                    'fps': self._safe_float(results[idx + 1]),
-                    'frames': self._safe_int(results[idx + 2])
-                }
-
-            return status
-
+        except zmq.Again:
+            # No messages available
+            pass
         except Exception as e:
-            # Log Redis errors occasionally
-            if not hasattr(self, '_last_redis_error') or time.time() - self._last_redis_error > 300:
-                self.log(f"Redis error: {e}")
-                self._last_redis_error = time.time()
-            return {}
+            self.queue_stats[port]['errors'] += 1
 
-    def _safe_float(self, value):
-        """Safely convert to float"""
+    def _get_system_stats(self):
+        """Get system CPU and memory stats"""
+        stats = {'cpu_percent': 0.0, 'memory_percent': 0.0, 'memory_mb': 0}
+
+        # CPU usage from /proc/stat
         try:
-            return float(value) if value else 0.0
-        except (ValueError, TypeError):
-            return 0.0
-
-    def _safe_int(self, value):
-        """Safely convert to int"""
-        try:
-            return int(value) if value else 0
-        except (ValueError, TypeError):
-            return 0
-
-    def get_system_stats(self):
-        """Get system stats efficiently from /proc"""
-        stats = {'cpu_percent': 0, 'memory_percent': 0, 'memory_mb': 0}
-
-        # CPU usage with proper calculation
-        try:
-            with open('/proc/stat', 'r') as f:
-                cpu_line = f.readline().strip().split()
-                if len(cpu_line) >= 8:
-                    # user, nice, system, idle, iowait, irq, softirq, steal
-                    times = list(map(int, cpu_line[1:8]))
-
-                    current_time = time.time()
-                    if self.last_cpu_times and current_time > self.last_cpu_time:
-                        # Calculate deltas
-                        deltas = [curr - prev for curr, prev in zip(times, self.last_cpu_times)]
-                        total_delta = sum(deltas)
-                        idle_delta = deltas[3]  # idle time delta
-
-                        if total_delta > 0:
-                            stats['cpu_percent'] = 100.0 * (total_delta - idle_delta) / total_delta
-
-                    self.last_cpu_times = times
-                    self.last_cpu_time = current_time
-        except (IOError, ValueError, IndexError):
+            with open('/proc/stat') as f:
+                cpu_line = f.readline()
+                if cpu_line.startswith('cpu '):
+                    values = cpu_line.split()[1:8]
+                    total = sum(int(v) for v in values)
+                    idle = int(values[3])
+                    if hasattr(self, '_last_cpu_total'):
+                        total_diff = total - self._last_cpu_total
+                        idle_diff = idle - self._last_cpu_idle
+                        if total_diff > 0:
+                            stats['cpu_percent'] = 100.0 * (1.0 - idle_diff / total_diff)
+                    self._last_cpu_total = total
+                    self._last_cpu_idle = idle
+        except:
             pass
 
-        # Memory from /proc/meminfo (more efficient parsing)
+        # Memory usage from /proc/meminfo
         try:
-            mem_info = {}
-            with open('/proc/meminfo', 'r') as f:
+            with open('/proc/meminfo') as f:
+                meminfo = {}
                 for line in f:
-                    if line.startswith('MemTotal:') or line.startswith('MemAvailable:'):
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            key = parts[0].rstrip(':')
-                            value = int(parts[1])  # KB
-                            mem_info[key] = value
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        key = parts[0].rstrip(':')
+                        value = int(parts[1])
+                        if key in ['MemTotal', 'MemAvailable']:
+                            meminfo[key] = value
 
-                        # Early exit if we have both values
-                        if len(mem_info) == 2:
-                            break
-
-            if 'MemTotal' in mem_info and 'MemAvailable' in mem_info:
-                total_kb = mem_info['MemTotal']
-                available_kb = mem_info['MemAvailable']
-                used_kb = total_kb - available_kb
-
-                stats['memory_percent'] = (100.0 * used_kb / total_kb) if total_kb > 0 else 0
-                stats['memory_mb'] = total_kb / 1024
-
-        except (IOError, ValueError, KeyError):
+                if 'MemTotal' in meminfo and 'MemAvailable' in meminfo:
+                    total = meminfo['MemTotal']
+                    available = meminfo['MemAvailable']
+                    stats['memory_mb'] = total / 1024
+                    stats['memory_percent'] = 100.0 * (1.0 - available / total)
+        except:
             pass
 
         return stats
 
-    def print_status(self):
-        """Print current status efficiently"""
-        # Get stats
-        sys_stats = self.get_system_stats()
-        services = self.get_service_status()
+    def _print_status(self):
+        """Generate and print system status report"""
+        sys_stats = self._get_system_stats()
+        services = self.metrics_collector.get_service_metrics()
 
-        # Build status lines
-        lines = [
-            "=" * 50,
-            f"Queue Monitor - {time.strftime('%H:%M:%S')}",
-            f"System: CPU {sys_stats['cpu_percent']:.1f}% | Memory {sys_stats['memory_percent']:.1f}%",
-            "-" * 50
-        ]
+        # Clear screen for dashboard effect
+        os.system('clear 2>/dev/null || cls 2>/dev/null')
 
-        # Queue stats
-        for port, stats in self.stats.items():
-            # Calculate average latency from recent samples
-            latencies = stats['latencies']
-            avg_latency = sum(latencies) / len(latencies) if latencies else 0
+        # Initialize lines list here!
+        lines = []
 
-            # Time since last message
-            time_since = time.time() - stats['last_seen'] if stats['last_seen'] > 0 else -1
+        # Header
+        lines.append("=" * 80)
+        lines.append(f"JVideo Pipeline Monitor - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"System: CPU {sys_stats['cpu_percent']:.1f}% | "
+                    f"Memory {sys_stats['memory_percent']:.1f}% "
+                    f"({sys_stats['memory_mb']:.0f} MB)")
+        lines.append("=" * 80)
 
-            if time_since < 0:
-                last_seen = "Never"
-            elif time_since < 60:
-                last_seen = f"{time_since:.0f}s"
+        # Queue Statistics
+        if self.mon_sockets:
+            lines.append("\nQueue Statistics:")
+            lines.append("-" * 80)
+            for port, stats in self.queue_stats.items():
+                age = "Never"
+                if stats['last_seen'] > 0:
+                    age = f"{time.time() - stats['last_seen']:.1f}s ago"
+
+                avg_latency = 0
+                if stats['latencies']:
+                    avg_latency = sum(stats['latencies']) / len(stats['latencies'])
+
+                lines.append(f"Port {port}: {stats['messages']:>8} msgs | "
+                            f"{stats['bytes']/1024/1024:>6.1f} MB | "
+                            f"Latency: {avg_latency:>5.1f} ms | "
+                            f"Last: {age:>12} | "
+                            f"Errors: {stats['errors']}")
+
+        # Service Statistics
+        lines.append("\nService Status:")
+        lines.append("-" * 80)
+
+        for name, info in services.items():
+            status = info.get('status', 'unknown')
+            pid = info.get('pid', 0)
+
+            if status == 'running':
+                uptime_min = info.get('uptime', 0) / 60
+                fps = info.get('current_fps', 0)
+                db_avg_fps = info.get('db_avg_fps', 0)
+
+                lines.append(f"\n{name.upper()} [{status}] PID: {pid} | Uptime: {uptime_min:.0f} min")
+                lines.append(f"  Current FPS: {fps:.1f} | Avg FPS (10m): {db_avg_fps:.1f}")
+
+                # Service-specific details
+                if name == 'frame-publisher':
+                    published = info.get('frames_published', 0)
+                    total = info.get('total_frames', 0)
+                    errors = info.get('errors', 0)
+                    video_path = info.get('video_path', 'unknown')
+
+                    # Fix for large frame count
+                    if total == 0 or total > 1000000000:
+                        frame_info = f"{published} frames"
+                    else:
+                        frame_info = f"{published}/{total} frames"
+
+                    lines.append(f"  Published: {frame_info} | Errors: {errors}")
+                    lines.append(f"  Video: {os.path.basename(video_path)}")
+                    lines.append(f"  Resolution: {info.get('video_width', 0)}x{info.get('video_height', 0)} @ {info.get('video_fps', 0):.1f} fps")
+
+                elif name == 'frame-resizer':
+                    processed = info.get('frames_processed', 0)
+                    dropped = info.get('frames_dropped', 0)
+                    proc_time = info.get('processing_time_ms', 0)
+                    errors = info.get('errors', 0)
+
+                    lines.append(f"  Processed: {processed} | Dropped: {dropped} | Errors: {errors}")
+                    lines.append(f"  Processing time: {proc_time:.1f} ms")
+                    lines.append(f"  Input: {info.get('input_width', 0)}x{info.get('input_height', 0)} -> "
+                                f"Output: {info.get('output_width', 0)}x{info.get('output_height', 0)}")
+
+                elif name == 'frame-saver':
+                    saved = info.get('frames_saved', 0)
+                    dropped = info.get('frames_dropped', 0)
+                    io_errors = info.get('io_errors', 0)
+                    save_time = info.get('save_time_ms', 0)
+                    disk_mb = info.get('disk_usage_mb', 0)
+
+                    lines.append(f"  Saved: {saved} | Dropped: {dropped} | IO Errors: {io_errors}")
+                    lines.append(f"  Save time: {save_time:.1f} ms | Disk usage: {disk_mb:.1f} MB")
+                    lines.append(f"  Output: {info.get('output_dir', 'unknown')}")
+
+                # Database stats
+                db_status = info.get('db_status', 'unknown')
+                if db_status == 'ok':
+                    samples = info.get('db_sample_count', 0)
+                    lines.append(f"  DB: {samples} samples in last 10 min")
+                else:
+                    lines.append(f"  DB: {db_status}")
+
             else:
-                last_seen = f"{time_since/60:.0f}m"
+                lines.append(f"\n{name.upper()} [{status}]")
 
-            lines.append(
-                f"Port {port}: {stats['messages']} msgs | "
-                f"{avg_latency:.1f}ms | {last_seen} | "
-                f"err:{stats['errors']}"
-            )
+        lines.append("\n" + "=" * 80)
+        lines.append("Press Ctrl+C to exit")
 
-        # Service stats (compact)
-        if services:
-            service_line = "Services: "
-            for name, info in services.items():
-                short_name = name.split('-')[1] if '-' in name else name
-                service_line += f"{short_name}:{info['status'][0].upper()}/{info['fps']:.0f} "
-            lines.append(service_line)
-
-        # Print all at once
-        self.log('\n'.join(lines))
+        # Print all lines
+        print('\n'.join(lines))
 
     def run(self):
         """Main monitoring loop"""
-        last_log = time.time()
-        loop_count = 0
+        last_display = time.time()
+
+        print("[Monitor] Starting monitoring loop...", file=sys.stderr)
 
         while self.running:
             try:
-                # Check all queues
-                for port, socket in self.mon_sockets:
-                    self.check_queue(port, socket)
+                # Check ZMQ queues if available
+                if self.mon_sockets:
+                    for port, socket in self.mon_sockets:
+                        self._check_zmq_queue(port, socket)
 
-                # Log status periodically
+                # Display status periodically
                 now = time.time()
-                if now - last_log >= self.config['log_interval']:
-                    self.print_status()
-                    last_log = now
+                if now - last_display >= self.config['display_interval']:
+                    self._print_status()
+                    last_display = now
 
-                # Periodic cleanup to prevent any memory growth
-                loop_count += 1
-                if loop_count % 1000 == 0:  # Every ~1.4 hours at 5s intervals
-                    self._cleanup_stats()
-
-                # Sleep to reduce CPU usage
+                # Small sleep to prevent CPU spinning
                 time.sleep(self.config['update_interval'])
+
+                if not (self.stats_counter % 20):
+                    self._cleanup_stats()
+                self.stats_counter += 1
 
             except KeyboardInterrupt:
                 break
             except Exception as e:
-                self.log(f"Error in main loop: {e}")
+                print(f"[Monitor] Error in main loop: {e}", file=sys.stderr)
                 time.sleep(5)
 
-        # Cleanup
         self.cleanup()
 
-    def _cleanup_stats(self):
-        """Periodic cleanup to prevent any memory growth"""
-        for port in self.stats:
-            # Reset counters if they get too large
-            if self.stats[port]['messages'] > 1000000:
-                self.stats[port]['messages'] = 0
-            if self.stats[port]['errors'] > 10000:
-                self.stats[port]['errors'] = 0
-
     def cleanup(self):
-        """Clean shutdown"""
-        self.log("Shutting down...")
+        """Clean up all resources"""
+        print("\n[Monitor] Cleaning up...", file=sys.stderr)
 
-        # Close sockets
+        # Close ZMQ sockets
         for _, socket in self.mon_sockets:
             try:
                 socket.close()
             except:
                 pass
 
-        # Close context
-        try:
-            self.zmq_context.term()
-        except:
-            pass
+        # Terminate ZMQ context
+        if self.zmq_context:
+            try:
+                self.zmq_context.term()
+            except:
+                pass
 
-        self.log("Queue Monitor stopped")
+        # Clean up metrics collector
+        self.metrics_collector.cleanup()
 
+        print("[Monitor] Shutdown complete", file=sys.stderr)
+
+    def _cleanup_stats(self):
+        """Periodic stats maintenance to prevent overflow"""
+        for port in self.queue_stats:
+            # Reset message counter if it gets too large
+            if self.queue_stats[port]['messages'] > 1000000:
+                print(f"[Monitor] Resetting message counter for port {port}", file=sys.stderr)
+                self.queue_stats[port]['messages'] = 0
+
+            # Reset byte counter if it gets too large
+            if self.queue_stats[port]['bytes'] > 1024 * 1024 * 1024:  # 1GB
+                print(f"[Monitor] Resetting byte counter for port {port}", file=sys.stderr)
+                self.queue_stats[port]['bytes'] = 0
+
+            # Reset error counter periodically
+            if self.queue_stats[port]['errors'] > 10000:
+                print(f"[Monitor] Resetting error counter for port {port}", file=sys.stderr)
+                self.queue_stats[port]['errors'] = 0
 
 def main():
-    """Main entry point"""
+    """Entry point"""
     try:
-        monitor = YoctoQueueMonitor()
+        monitor = QueueMonitor()
         monitor.run()
     except Exception as e:
-        print(f"Fatal error: {e}", file=sys.stderr)
+        print(f"[Monitor] Fatal error: {e}", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

@@ -2,18 +2,29 @@ cmake_minimum_required(VERSION 3.16)
 project(jvideo-services)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(OPENCV REQUIRED opencv4)
 pkg_check_modules(ZMQ REQUIRED libzmq)
 pkg_check_modules(SQLITE3 REQUIRED sqlite3)
 
-# Find nlohmann-json
+find_package(OpenCV REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(Threads REQUIRED)
 
 set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -ffunction-sections -fdata-sections")
 set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-Wl,--gc-sections")
+
+# Common libraries
+set(COMMON_LIBS
+    ${OpenCV_LIBS}
+    ${ZMQ_LIBRARIES}
+    ${SQLITE3_LIBRARIES}
+    nlohmann_json::nlohmann_json
+    Threads::Threads
+    rt
+)
 
 # Frame Publisher executable
 add_executable(frame-publisher-cpp frame_publisher.cpp)
@@ -23,11 +34,7 @@ target_include_directories(frame-publisher-cpp PRIVATE
     ${SQLITE3_INCLUDE_DIRS}
 )
 target_link_libraries(frame-publisher-cpp
-    ${OPENCV_LIBRARIES}
-    ${ZMQ_LIBRARIES}
-    ${SQLITE3_LIBRARIES}
-    nlohmann_json::nlohmann_json
-    pthread
+    ${COMMON_LIBS}
 )
 target_compile_options(frame-publisher-cpp PRIVATE
     ${OPENCV_CFLAGS_OTHER}
@@ -43,11 +50,7 @@ target_include_directories(frame-resizer-cpp PRIVATE
     ${SQLITE3_INCLUDE_DIRS}
 )
 target_link_libraries(frame-resizer-cpp
-    ${OPENCV_LIBRARIES}
-    ${ZMQ_LIBRARIES}
-    ${SQLITE3_LIBRARIES}
-    nlohmann_json::nlohmann_json
-    pthread
+    ${COMMON_LIBS}
 )
 target_compile_options(frame-resizer-cpp PRIVATE
     ${OPENCV_CFLAGS_OTHER}
@@ -63,12 +66,7 @@ target_include_directories(frame-saver-cpp PRIVATE
     ${SQLITE3_INCLUDE_DIRS}
 )
 target_link_libraries(frame-saver-cpp
-    ${OPENCV_LIBRARIES}
-    ${ZMQ_LIBRARIES}
-    ${SQLITE3_LIBRARIES}
-    nlohmann_json::nlohmann_json
-    pthread
-    stdc++fs  # For std::filesystem
+    ${COMMON_LIBS}
 )
 target_compile_options(frame-saver-cpp PRIVATE
     ${OPENCV_CFLAGS_OTHER}
