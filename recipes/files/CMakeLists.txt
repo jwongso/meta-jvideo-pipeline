@@ -74,4 +74,18 @@ target_compile_options(frame-saver-cpp PRIVATE
     ${SQLITE3_CFLAGS_OTHER}
 )
 
-install(TARGETS frame-publisher-cpp frame-resizer-cpp frame-saver-cpp RUNTIME DESTINATION bin)
+# Queue Monitor executable
+add_executable(queue-monitor-cpp queue_monitor.cpp)
+target_include_directories(queue-monitor-cpp PRIVATE
+    ${ZMQ_INCLUDE_DIRS}
+    ${SQLITE3_INCLUDE_DIRS}
+)
+target_link_libraries(queue-monitor-cpp
+    ${COMMON_LIBS}
+)
+target_compile_options(queue-monitor-cpp PRIVATE
+    ${ZMQ_CFLAGS_OTHER}
+    ${SQLITE3_CFLAGS_OTHER}
+)
+
+install(TARGETS frame-publisher-cpp frame-resizer-cpp frame-saver-cpp queue-monitor-cpp RUNTIME DESTINATION bin)

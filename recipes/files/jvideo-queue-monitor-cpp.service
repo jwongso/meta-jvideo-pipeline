@@ -1,14 +1,14 @@
 [Unit]
-Description=Juni's Frame Saver Service (C++)
-After=network.target redis.service
-Conflicts=jvideo-frame-saver-python.service
+Description=Juni's Queue Monitor Service (C++)
+Wants=redis.service
+Conflicts=jvideo-queue-monitor-python.service
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/opt/jvideo
 Environment="JVIDEO_SERVICE_IMPL=cpp"
-ExecStart=/opt/jvideo/bin/frame-saver-cpp
+ExecStart=/opt/jvideo/bin/queue-monitor-cpp
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

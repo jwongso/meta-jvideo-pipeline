@@ -53,6 +53,8 @@ SRC_URI = " \
     file://frame_saver.py \
     file://frame_saver.cpp \
     file://queue_monitor.py \
+    file://queue_monitor.cpp \
+    file://shm_services.h \
     file://CMakeLists.txt \
     file://frame-publisher.conf \
     file://frame-resizer.conf \
@@ -65,7 +67,8 @@ SRC_URI = " \
     file://jvideo-frame-resizer-cpp.service \
     file://jvideo-frame-saver-python.service \
     file://jvideo-frame-saver-cpp.service \
-    file://jvideo-queue-monitor.service \
+    file://jvideo-queue-monitor-cpp.service \
+    file://jvideo-queue-monitor-python.service \
     "
 
 S = "${WORKDIR}"
@@ -81,7 +84,8 @@ SYSTEMD_SERVICE:${PN} = " \
     jvideo-frame-resizer-cpp.service \
     jvideo-frame-saver-python.service \
     jvideo-frame-saver-cpp.service \
-    jvideo-queue-monitor.service \
+    jvideo-queue-monitor-cpp.service \
+    jvideo-queue-monitor-python.service \
     "
 
 SYSTEMD_AUTO_ENABLE:${PN} = "disable"
@@ -182,7 +186,6 @@ do_install() {
     install -d ${D}/etc/jvideo
     install -d ${D}/var/lib/jvideo
     install -d ${D}/var/lib/jvideo/frames
-    install -d ${D}/var/lib/jvideo/db
     install -d ${D}/usr/bin
 
     # Create tmpfiles.d configuration for directories and shared memory
@@ -190,7 +193,6 @@ do_install() {
     echo "d /var/log/jvideo 0755 root root -" > ${D}${sysconfdir}/tmpfiles.d/jvideo.conf
     echo "d /var/lib/jvideo 0755 root root -" >> ${D}${sysconfdir}/tmpfiles.d/jvideo.conf
     echo "d /var/lib/jvideo/frames 0755 root root -" >> ${D}${sysconfdir}/tmpfiles.d/jvideo.conf
-    echo "d /var/lib/jvideo/db 0755 root root -" >> ${D}${sysconfdir}/tmpfiles.d/jvideo.conf
     echo "d /dev/shm/jvideo 0755 root root -" >> ${D}${sysconfdir}/tmpfiles.d/jvideo.conf
 
     # Install Python services - Added queue_monitor.py
@@ -218,6 +220,12 @@ do_install() {
         install -m 0755 ${WORKDIR}/build/frame-saver-cpp ${D}/opt/jvideo/bin/
     else
         bbfatal "C++ frame-saver binary not found at ${WORKDIR}/build/frame-saver-cpp"
+    fi
+
+    if [ -f ${WORKDIR}/build/queue-monitor-cpp ]; then
+        install -m 0755 ${WORKDIR}/build/queue-monitor-cpp ${D}/opt/jvideo/bin/
+    else
+        bbfatal "C++ queue-monitor binary not found at ${WORKDIR}/build/queue-monitor-cpp"
     fi
 
     # Install Rust binary or stub (unchanged)
@@ -251,7 +259,8 @@ do_install() {
     install -m 0644 ${S}/jvideo-frame-resizer-cpp.service ${D}${systemd_system_unitdir}/
     install -m 0644 ${S}/jvideo-frame-saver-python.service ${D}${systemd_system_unitdir}/
     install -m 0644 ${S}/jvideo-frame-saver-cpp.service ${D}${systemd_system_unitdir}/
-    install -m 0644 ${S}/jvideo-queue-monitor.service ${D}${systemd_system_unitdir}/
+    install -m 0644 ${S}/jvideo-queue-monitor-cpp.service ${D}${systemd_system_unitdir}/
+    install -m 0644 ${S}/jvideo-queue-monitor-python.service ${D}${systemd_system_unitdir}/
 
     # Create control script
     echo '#!/bin/bash' > ${D}/usr/bin/jvideo-control
@@ -260,7 +269,7 @@ do_install() {
 
     # Create dashboard script for direct access to queue monitor
     echo '#!/bin/bash' > ${D}/usr/bin/jvideo-dashboard
-    echo 'exec /usr/bin/python3 /opt/jvideo/services/queue_monitor.py "$@"' >> ${D}/usr/bin/jvideo-dashboard
+    echo 'exec /opt/jvideo/bin/queue-monitor-cpp "$@"' >> ${D}/usr/bin/jvideo-dashboard
     chmod 0755 ${D}/usr/bin/jvideo-dashboard
 }
 

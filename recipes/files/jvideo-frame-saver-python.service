@@ -1,6 +1,7 @@
 [Unit]
 Description=Juni's Frame Saver Service (Python)
 After=network.target redis.service
+Conflicts=jvideo-frame-saver-cpp.service
 
 [Service]
 Type=simple

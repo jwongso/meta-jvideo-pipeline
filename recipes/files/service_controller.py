@@ -38,10 +38,9 @@ class ServiceController:
                 'default': 'cpp'
             },
             'queue-monitor': {
-                'unit_template': 'jvideo-queue-monitor.service',
-                'languages': ['python'],
-                'default': 'python',
-                'single_impl': True
+                'unit_template': 'jvideo-queue-monitor-{lang}.service',
+                'languages': ['python', 'cpp'],
+                'default': 'cpp'
             }
         }
 

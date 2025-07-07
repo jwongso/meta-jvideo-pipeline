@@ -86,7 +86,7 @@ configure_jvideo() {
     echo '    },' >> ${IMAGE_ROOTFS}/etc/jvideo/services.conf
     echo '    "queue-monitor": {' >> ${IMAGE_ROOTFS}/etc/jvideo/services.conf
     echo '      "enabled": true,' >> ${IMAGE_ROOTFS}/etc/jvideo/services.conf
-    echo '      "language": "python",' >> ${IMAGE_ROOTFS}/etc/jvideo/services.conf
+    echo '      "language": "cpp",' >> ${IMAGE_ROOTFS}/etc/jvideo/services.conf
     echo '      "auto_restart": true,' >> ${IMAGE_ROOTFS}/etc/jvideo/services.conf
     echo '      "restart_delay": 5' >> ${IMAGE_ROOTFS}/etc/jvideo/services.conf
     echo '    }' >> ${IMAGE_ROOTFS}/etc/jvideo/services.conf
