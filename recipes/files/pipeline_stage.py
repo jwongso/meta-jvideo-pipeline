@@ -12,13 +12,22 @@ import sqlite3
 import threading
 import queue
 import logging
+import struct
+import mmap
+import fcntl
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
-import struct
-import mmap
-import msgpack
+
+# Try to import msgpack, fall back to json if not available
+try:
+    import msgpack
+    USE_MSGPACK = True
+except ImportError:
+    USE_MSGPACK = False
+    print("WARNING: msgpack not available, falling back to JSON (less efficient)")
+
 import psutil
 import zmq
 
@@ -84,8 +93,9 @@ class SaverMetrics(BaseMetrics):
     avg_save_latency_ms: float = 0.0
     tracked_frames: int = 0
 
+
 class MetricsManager:
-    """Manages shared memory metrics using MessagePack"""
+    """Manages shared memory metrics using MessagePack or JSON"""
 
     def __init__(self, service_name: str, metrics_class: type, create: bool = True):
         self.service_name = service_name
@@ -129,21 +139,65 @@ class MetricsManager:
         self.mm = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
         self.metrics = self._read_from_shm()
 
-    def _read_from_shm(self):
-        """Read metrics from shared memory"""
-        with self._lock:
-            self.mm.seek(64)  # Skip mutex area
-            size_bytes = self.mm.read(8)
-            if len(size_bytes) < 8:
-                return None
+    def _get_ordered_dict(self, metrics):
+        """Convert metrics to OrderedDict with correct field order"""
+        from collections import OrderedDict
 
-            size = struct.unpack('Q', size_bytes)[0]
-            if size == 0 or size > 8192:
-                return None
+        # Base fields (same for all)
+        result = OrderedDict([
+            ('service_name', metrics.service_name),
+            ('service_pid', metrics.service_pid),
+            ('errors', metrics.errors),
+            ('current_fps', metrics.current_fps),
+            ('last_update_time', metrics.last_update_time),
+            ('service_start_time', metrics.service_start_time),
+        ])
 
-            data = self.mm.read(size)
-            metrics_dict = msgpack.unpackb(data, raw=False)
-            return self.metrics_class(**metrics_dict)
+        # Service-specific fields
+        if isinstance(metrics, PublisherMetrics):
+            result.update([
+                ('frames_published', metrics.frames_published),
+                ('total_frames', metrics.total_frames),
+                ('video_fps', metrics.video_fps),
+                ('video_width', metrics.video_width),
+                ('video_height', metrics.video_height),
+                ('video_healthy', metrics.video_healthy),
+                ('video_path', metrics.video_path),
+            ])
+        elif isinstance(metrics, ResizerMetrics):
+            result.update([
+                ('frames_processed', metrics.frames_processed),
+                ('frames_dropped', metrics.frames_dropped),
+                ('processing_time_ms', metrics.processing_time_ms),
+                ('input_width', metrics.input_width),
+                ('input_height', metrics.input_height),
+                ('output_width', metrics.output_width),
+                ('output_height', metrics.output_height),
+                ('service_healthy', metrics.service_healthy),
+            ])
+        elif isinstance(metrics, SaverMetrics):
+            result.update([
+                ('frames_saved', metrics.frames_saved),
+                ('frames_dropped', metrics.frames_dropped),
+                ('io_errors', metrics.io_errors),
+                ('save_time_ms', metrics.save_time_ms),
+                ('disk_usage_mb', metrics.disk_usage_mb),
+                ('frame_width', metrics.frame_width),
+                ('frame_height', metrics.frame_height),
+                ('frame_channels', metrics.frame_channels),
+                ('disk_healthy', metrics.disk_healthy),
+                ('output_dir', metrics.output_dir),
+                ('format', metrics.format),
+                ('avg_total_latency_ms', metrics.avg_total_latency_ms),
+                ('min_total_latency_ms', metrics.min_total_latency_ms),
+                ('max_total_latency_ms', metrics.max_total_latency_ms),
+                ('avg_publish_latency_ms', metrics.avg_publish_latency_ms),
+                ('avg_resize_latency_ms', metrics.avg_resize_latency_ms),
+                ('avg_save_latency_ms', metrics.avg_save_latency_ms),
+                ('tracked_frames', metrics.tracked_frames),
+            ])
+
+        return result
 
     def commit(self):
         """Write metrics to shared memory"""
@@ -152,12 +206,49 @@ class MetricsManager:
 
         with self._lock:
             self.metrics.last_update_time = int(time.time() * 1e9)
-            data = msgpack.packb(asdict(self.metrics))
 
-            self.mm.seek(64)  # Skip mutex area
-            self.mm.write(struct.pack('Q', len(data)))
-            self.mm.write(data)
-            self.mm.flush()
+            # Use ordered dict to ensure consistent field order
+            ordered_data = self._get_ordered_dict(self.metrics)
+
+            if USE_MSGPACK:
+                data = msgpack.packb(ordered_data)
+            else:
+                data = json.dumps(ordered_data).encode('utf-8')
+
+            # File locking for multi-process safety
+            fcntl.flock(self.file.fileno(), fcntl.LOCK_EX)
+            try:
+                self.mm.seek(64)  # Skip reserved area
+                self.mm.write(struct.pack('<Q', len(data)))  # Little-endian
+                self.mm.write(data)
+                self.mm.flush()
+            finally:
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
+
+    def _read_from_shm(self):
+        """Read metrics from shared memory"""
+        with self._lock:
+            fcntl.flock(self.file.fileno(), fcntl.LOCK_SH)
+            try:
+                self.mm.seek(64)  # Skip reserved area
+                size_bytes = self.mm.read(8)
+                if len(size_bytes) < 8:
+                    return None
+
+                size = struct.unpack('<Q', size_bytes)[0]  # Little-endian
+                if size == 0 or size > 8192:
+                    return None
+
+                data = self.mm.read(size)
+
+                if USE_MSGPACK:
+                    metrics_dict = msgpack.unpackb(data, raw=False)
+                else:
+                    metrics_dict = json.loads(data.decode('utf-8'))
+
+                return self.metrics_class(**metrics_dict)
+            finally:
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
 
     def update(self, **kwargs):
         """Update metrics fields"""
@@ -167,7 +258,7 @@ class MetricsManager:
 
     def get_metrics(self) -> Optional[BaseMetrics]:
         """Get current metrics"""
-        if self.mm and not self.mm.closed and self.mm.readable():
+        if self.mm and not self.mm.closed:
             return self._read_from_shm()
         return self.metrics
 
@@ -177,6 +268,7 @@ class MetricsManager:
             self.mm.close()
         if self.file:
             self.file.close()
+
 
 class PipelineStage(ABC):
     """Base class for all pipeline stages"""
@@ -194,6 +286,7 @@ class PipelineStage(ABC):
         # Timing
         self.start_time = time.time()
         self.last_fps_update = self.start_time
+        self.last_watchdog = self.start_time
 
         # Counters
         self.frames_processed = 0
@@ -205,7 +298,6 @@ class PipelineStage(ABC):
         self.export_interval = 1000
 
         # Database
-        self.db_conn = None
         self.db_queue = queue.Queue()
         self.db_thread = None
 
@@ -215,9 +307,38 @@ class PipelineStage(ABC):
         # Process monitor
         self.process = psutil.Process()
 
+        # Systemd watchdog
+        self.watchdog_interval = None
+        self._setup_watchdog()
+
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _setup_watchdog(self):
+        """Setup systemd watchdog if enabled"""
+        watchdog_usec = os.environ.get('WATCHDOG_USEC')
+        if watchdog_usec:
+            # Use half the watchdog interval for safety
+            self.watchdog_interval = int(watchdog_usec) / 1000000 / 2
+            self.logger.info(f"Systemd watchdog enabled, interval: {self.watchdog_interval:.1f}s")
+
+    def _notify_watchdog(self):
+        """Notify systemd watchdog that we're alive"""
+        if self.watchdog_interval:
+            now = time.time()
+            if now - self.last_watchdog >= self.watchdog_interval:
+                try:
+                    # Notify systemd
+                    notify_socket = os.environ.get('NOTIFY_SOCKET')
+                    if notify_socket:
+                        import socket
+                        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+                        sock.sendto(b'WATCHDOG=1', notify_socket)
+                        sock.close()
+                        self.last_watchdog = now
+                except Exception as e:
+                    self.logger.error(f"Failed to notify watchdog: {e}")
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
@@ -248,7 +369,7 @@ class PipelineStage(ABC):
 
         # Extract common settings
         self.db_path = self.config.get('benchmark_db_path',
-                                       f"/var/lib/jvideo/db/{self.service_name}_benchmarks.db")
+                                       f"/var/lib/jvideo/db/{self.service_name.replace('-', '_')}_benchmarks.db")
         self.export_interval = self.config.get('benchmark_export_interval', 1000)
 
     def initialize_metrics(self):
@@ -265,74 +386,79 @@ class PipelineStage(ABC):
             # Create directory if needed
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
-            # Create database
-            self.db_conn = sqlite3.connect(':memory:')
-            self.db_conn.execute("PRAGMA synchronous = OFF")
-            self.db_conn.execute("PRAGMA journal_mode = MEMORY")
-
-            # Create schema
-            self.db_conn.executescript(self.get_database_schema())
-
-            # Start background thread for database exports
+            # Start background thread for database operations
             self.db_thread = threading.Thread(target=self._db_worker, daemon=True)
             self.db_thread.start()
-
-            # Force initial export
-            self.export_database()
 
         except Exception as e:
             self.logger.error(f"Database initialization failed: {e}")
 
     def _db_worker(self):
         """Background worker for database operations"""
-        while not self._shutdown_event.is_set():
-            try:
-                # Wait for export request
-                task = self.db_queue.get(timeout=1.0)
-                if task == 'export':
-                    self._export_database_sync()
-                elif task == 'shutdown':
-                    break
-            except queue.Empty:
-                continue
-            except Exception as e:
-                self.logger.error(f"Database worker error: {e}")
-
-    def _export_database_sync(self):
-        """Synchronously export database to file"""
+        # Create database connection in this thread
+        db_conn = None
         try:
-            file_conn = sqlite3.connect(self.db_path)
+            db_conn = sqlite3.connect(self.db_path)
+            db_conn.execute("PRAGMA synchronous = OFF")
+            db_conn.execute("PRAGMA journal_mode = WAL")
 
-            # Create schema in file database
-            file_conn.executescript(self.get_database_schema())
+            # Create schema
+            db_conn.executescript(self.get_database_schema())
+            db_conn.commit()
 
-            # Copy data
-            self.db_conn.backup(file_conn)
-            file_conn.close()
+            self.logger.info("Database worker started")
 
-            self.logger.debug(f"Exported database to {self.db_path}")
+            while not self._shutdown_event.is_set():
+                try:
+                    # Wait for task
+                    task = self.db_queue.get(timeout=1.0)
+
+                    if task['type'] == 'store':
+                        self._store_benchmark_internal(db_conn, task['metrics'])
+                    elif task['type'] == 'shutdown':
+                        break
+
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    self.logger.error(f"Database worker error: {e}")
 
         except Exception as e:
-            self.logger.error(f"Database export failed: {e}")
+            self.logger.error(f"Database worker initialization failed: {e}")
+        finally:
+            if db_conn:
+                db_conn.close()
+            self.logger.info("Database worker stopped")
 
-    def export_database(self):
-        """Queue database export"""
+    def _store_benchmark_internal(self, db_conn, metrics):
+        """Store benchmark data (called in db worker thread)"""
         try:
-            self.db_queue.put_nowait('export')
-        except queue.Full:
-            pass  # Skip if queue is full
+            self.store_benchmark_data_internal(db_conn, metrics)
+            db_conn.commit()
+        except Exception as e:
+            self.logger.error(f"Failed to store benchmark: {e}")
+
+    def store_benchmark_data_internal(self, db_conn, metrics):
+        """Store metrics to database (to be overridden by subclasses)"""
+        # This will be implemented by derived classes
+        pass
 
     def store_benchmark(self):
-        """Store current metrics to database"""
-        if not self.db_conn or not self.metrics_mgr:
+        """Queue benchmark storage"""
+        if not self.metrics_mgr:
             return
 
         try:
             metrics = self.metrics_mgr.get_metrics()
             if metrics:
-                self.store_benchmark_data(metrics)
+                self.db_queue.put_nowait({
+                    'type': 'store',
+                    'metrics': metrics
+                })
+        except queue.Full:
+            self.logger.warning("Database queue full, dropping benchmark")
         except Exception as e:
-            self.logger.error(f"Failed to store benchmark: {e}")
+            self.logger.error(f"Failed to queue benchmark: {e}")
 
     def update_metrics(self):
         """Update metrics and store benchmark"""
@@ -358,8 +484,6 @@ class PipelineStage(ABC):
         # Store benchmark periodically
         if self.frames_processed % self.export_interval == 0:
             self.store_benchmark()
-            self.export_database()
-
             self.logger.info(f"Processed {self.frames_processed} frames, "
                            f"FPS: {current_fps:.1f}")
 
@@ -372,6 +496,9 @@ class PipelineStage(ABC):
 
         try:
             while self.running:
+                # Notify watchdog
+                self._notify_watchdog()
+
                 if not self.process_frame():
                     time.sleep(0.001)  # Brief sleep if no frame
 
@@ -394,15 +521,10 @@ class PipelineStage(ABC):
 
         # Shutdown database worker
         if self.db_queue:
-            self.db_queue.put('shutdown')
+            self.db_queue.put({'type': 'shutdown'})
 
         if self.db_thread:
             self.db_thread.join(timeout=5.0)
-
-        # Final database export
-        if self.db_conn:
-            self._export_database_sync()
-            self.db_conn.close()
 
         # Close metrics
         if self.metrics_mgr:
@@ -432,8 +554,14 @@ class PipelineStage(ABC):
 
     @abstractmethod
     def store_benchmark_data(self, metrics: BaseMetrics):
-        """Store metrics to database"""
+        """Store metrics to database (compatibility method)"""
         pass
+
+    def store_benchmark_data_internal(self, db_conn, metrics: BaseMetrics):
+        """Store metrics to database using provided connection"""
+        # Default implementation calls the old method for compatibility
+        # Subclasses should override this to use db_conn directly
+        self.store_benchmark_data(metrics)
 
     @abstractmethod
     def process_frame(self) -> bool:

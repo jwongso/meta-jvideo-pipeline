@@ -74,6 +74,29 @@ class FramePublisher(PipelineStage):
             CREATE INDEX IF NOT EXISTS idx_timestamp ON publisher_benchmarks(timestamp);
         """
 
+    def store_benchmark_data_internal(self, db_conn, metrics: PublisherMetrics):
+        """Store metrics to database using provided connection"""
+        uptime = int(time.time() - metrics.service_start_time / 1e9)
+
+        # Use nanosecond timestamp to avoid collisions
+        timestamp_ns = int(time.time() * 1e9)
+
+        db_conn.execute("""
+            INSERT OR REPLACE INTO publisher_benchmarks
+            (timestamp, frames_published, total_frames, current_fps, video_fps,
+            errors, uptime_seconds, memory_usage_kb)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            timestamp_ns,  # Changed to nanosecond precision
+            metrics.frames_published,
+            metrics.total_frames,
+            metrics.current_fps,
+            metrics.video_fps,
+            metrics.errors,
+            uptime,
+            self.get_memory_usage()
+        ))
+
     def store_benchmark_data(self, metrics: PublisherMetrics):
         """Store metrics to database"""
         uptime = int(time.time() - metrics.service_start_time / 1e9)
@@ -187,7 +210,7 @@ class FramePublisher(PipelineStage):
             publish_time = time.time()
             metadata = {
                 'frame_id': self.frames_processed,
-                'timestamp': publish_time,
+                'timestamp': publish_time,  # Keep as seconds (float)
                 'width': self.frame_buffer.shape[1],
                 'height': self.frame_buffer.shape[0],
                 'channels': self.frame_buffer.shape[2],
@@ -195,8 +218,8 @@ class FramePublisher(PipelineStage):
                 'tracking': {
                     'frame_id': int(time.time() * 1e9),
                     'sequence': self.frame_counter,
-                    'source_ts': read_start,
-                    'publish_ts': publish_time
+                    'source_ts': read_start,      # Seconds (float)
+                    'publish_ts': publish_time    # Seconds (float)
                 }
             }
 

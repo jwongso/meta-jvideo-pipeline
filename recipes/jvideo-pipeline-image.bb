@@ -10,7 +10,7 @@ IMAGE_FEATURES += "ssh-server-openssh"
 # Add development/debugging tools
 EXTRA_IMAGE_FEATURES += "debug-tweaks tools-debug"
 
-# QEMU memory settings - moved from local.conf
+# QEMU memory settings
 QB_MEM = "-m 1024"
 
 # Install systemd
@@ -32,6 +32,8 @@ IMAGE_INSTALL += " \
     nano \
     python3 \
     python3-psutil \
+    python3-msgpack \
+    python3-fcntl \
     sqlite3 \
     gstreamer1.0 \
     gstreamer1.0-plugins-base \
@@ -63,7 +65,7 @@ configure_jvideo() {
     # Create directory for config
     install -d ${IMAGE_ROOTFS}/etc/jvideo
 
-    # Create initial configuration - Updated to include queue-monitor
+    # Create initial configuration
     echo '{' > ${IMAGE_ROOTFS}/etc/jvideo/services.conf
     echo '  "services": {' >> ${IMAGE_ROOTFS}/etc/jvideo/services.conf
     echo '    "frame-publisher": {' >> ${IMAGE_ROOTFS}/etc/jvideo/services.conf
@@ -93,14 +95,11 @@ configure_jvideo() {
     echo '  }' >> ${IMAGE_ROOTFS}/etc/jvideo/services.conf
     echo '}' >> ${IMAGE_ROOTFS}/etc/jvideo/services.conf
 
-    # ... (rest of config files remain the same) ...
-
     # Create output directory
     install -d ${IMAGE_ROOTFS}/var/lib/jvideo/frames
+    install -d ${IMAGE_ROOTFS}/var/lib/jvideo/db
     chmod 755 ${IMAGE_ROOTFS}/var/lib/jvideo/frames
-
-    # Create a symlink for convenience
-    ln -sf /mnt/host/frames ${IMAGE_ROOTFS}/var/lib/jvideo/frames-host
+    chmod 755 ${IMAGE_ROOTFS}/var/lib/jvideo/db
 }
 
 enable_jvideo_services() {
@@ -127,7 +126,7 @@ EOF
     # Enable the autostart service
     ln -sf /etc/systemd/system/jvideo-pipeline.service ${IMAGE_ROOTFS}/etc/systemd/system/multi-user.target.wants/jvideo-pipeline.service
 
-    # Create startup script for manual control - Updated with database info
+    # Create startup script for manual control
     cat > ${IMAGE_ROOTFS}/etc/profile.d/jvideo-welcome.sh << 'EOF'
 #!/bin/sh
 echo ""
@@ -143,8 +142,8 @@ echo "  jvideo-dashboard            - Open monitoring dashboard"
 echo ""
 echo "Available services: frame-publisher, frame-resizer, frame-saver, queue-monitor"
 echo "Saved frames: /var/lib/jvideo/frames/"
-echo "Database: /var/log/jvideo/frame_*_benchmarks.db"
-echo "Shared memory: /dev/shm/jvideo/"
+echo "Database: /var/lib/jvideo/db/"
+echo "Shared memory: /dev/shm/jvideo_*"
 echo "=========================================================="
 echo ""
 EOF

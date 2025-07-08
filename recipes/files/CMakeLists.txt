@@ -12,9 +12,7 @@ pkg_check_modules(SYSTEMD libsystemd)
 find_package(OpenCV REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(Threads REQUIRED)
-find_package(Boost REQUIRED COMPONENTS system filesystem)
 
-# Find MessagePack - try both methods
 # Find MessagePack
 find_path(MSGPACK_INCLUDE_DIRS msgpack.hpp
     PATHS /usr/include /usr/local/include
@@ -33,25 +31,22 @@ set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -ffunction-sections -fdata-sections")
 set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-Wl,--gc-sections")
 
-# Common libraries
+# Common libraries - Removed Boost dependencies
 set(COMMON_LIBS
     ${OpenCV_LIBS}
     ${ZMQ_LIBRARIES}
     ${SQLITE3_LIBRARIES}
     nlohmann_json::nlohmann_json
     Threads::Threads
-    Boost::system
-    Boost::filesystem
     systemd
     rt
 )
 
-# Common include directories
+# Common include directories - Removed Boost includes
 set(COMMON_INCLUDES
     ${OPENCV_INCLUDE_DIRS}
     ${ZMQ_INCLUDE_DIRS}
     ${SQLITE3_INCLUDE_DIRS}
-    ${Boost_INCLUDE_DIRS}
     ${MSGPACK_INCLUDE_DIRS}
 )
 

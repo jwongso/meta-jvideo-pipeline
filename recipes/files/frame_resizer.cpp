@@ -99,19 +99,23 @@ protected:
         // Update tracking timestamp
         double resize_time = duration<double>(proc_start.time_since_epoch()).count();
         if (metadata.contains("tracking")) {
-            metadata["tracking"]["resize_ts"] = resize_time;
+            auto& tracking = metadata["tracking"];
 
-            // Log tracking for sample frames
-            if (metadata["tracking"].contains("sequence")) {
-                uint64_t seq = metadata["tracking"]["sequence"].get<uint64_t>();
-                if (seq % 100 == 0) {
-                    double source_ts = metadata["tracking"]["source_ts"].get<double>();
-                    double latency_ms = (resize_time - source_ts) * 1000;
-                    std::cout << "[Resizer] Processing frame " << seq
-                            << " - Latency so far: " << std::fixed << std::setprecision(1)
-                            << latency_ms << "ms" << std::endl;
-                }
-            }
+            // These are in seconds (as float/double)
+            double source_ts = tracking["source_ts"];
+            double publish_ts = tracking["publish_ts"];
+
+            // Current time in seconds
+            double current_time = std::chrono::duration<double>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count();
+
+            // Calculate latencies in milliseconds
+            double publish_latency_ms = (publish_ts - source_ts) * 1000.0;
+            double resize_latency_ms = (current_time - publish_ts) * 1000.0;
+
+            // Add current timestamp for next service
+            tracking["resize_ts"] = current_time;  // In seconds
         }
 
         // Decode frame
