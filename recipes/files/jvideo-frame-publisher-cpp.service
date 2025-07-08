@@ -1,7 +1,6 @@
 [Unit]
 Description=Juni's Frame Publisher Service (C++)
-After=network.target redis.service
-Wants=redis.service
+After=network.target
 Conflicts=jvideo-frame-publisher-python.service jvideo-frame-publisher-rust.service
 
 [Service]

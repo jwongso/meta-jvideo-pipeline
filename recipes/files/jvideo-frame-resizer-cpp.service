@@ -1,6 +1,6 @@
 [Unit]
 Description=Juni's Frame Resizer Service (C++)
-After=network.target redis.service
+After=network.target
 Conflicts=jvideo-frame-resizer-python.service
 
 [Service]

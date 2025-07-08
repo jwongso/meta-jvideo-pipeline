@@ -2,7 +2,6 @@
 """Base class for Juni's Video Pipeline services"""
 
 import zmq
-import redis
 import json
 import time
 import logging
@@ -16,7 +15,6 @@ class ServiceBase:
         self.running = True
         self.setup_logging()
         self.setup_zmq()
-        self.setup_redis()
         self.setup_signal_handlers()
 
         self.metrics = {
@@ -56,23 +54,6 @@ class ServiceBase:
         self.zmq_context = zmq.Context()
         self.logger.info("ZeroMQ context created")
 
-    def setup_redis(self):
-        """Setup Redis connection with fallback"""
-        try:
-            self.redis = redis.Redis(
-                host='localhost',
-                port=6379,
-                decode_responses=True,
-                socket_connect_timeout=2
-            )
-            self.redis.ping()
-            self.redis_available = True
-            self.logger.info("Redis connected successfully")
-        except Exception as e:
-            self.redis_available = False
-            self.logger.warning(f"Redis not available: {e}")
-            self.logger.warning("Running without Redis metrics")
-
     def setup_signal_handlers(self):
         """Setup graceful shutdown"""
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -84,18 +65,8 @@ class ServiceBase:
         self.running = False
 
     def update_metrics(self, key, value):
-        """Update metrics in Redis if available"""
+        """Update internal metrics"""
         self.metrics[key] = value
-
-        if self.redis_available:
-            try:
-                self.redis.hset(
-                    f'metrics:{self.service_name}',
-                    key,
-                    str(value)
-                )
-            except Exception as e:
-                self.logger.debug(f"Redis update failed: {e}")
 
     def log_metrics(self):
         """Periodically log metrics"""
@@ -105,3 +76,9 @@ class ServiceBase:
             f"Metrics - Frames: {self.metrics['frames_processed']}, "
             f"FPS: {fps:.2f}, Errors: {self.metrics['errors']}"
         )
+
+    def cleanup(self):
+        """Clean up resources"""
+        if hasattr(self, 'zmq_context'):
+            self.zmq_context.term()
+        self.logger.info(f"{self.service_name} cleanup completed")

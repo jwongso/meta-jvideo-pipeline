@@ -25,7 +25,7 @@ IMAGE_INSTALL += " \
     jvideo-services \
     "
 
-# Add useful system tools - Removed Redis, added SQLite
+# Add useful system tools
 IMAGE_INSTALL += " \
     htop \
     vim \
@@ -98,12 +98,6 @@ configure_jvideo() {
     # Create output directory
     install -d ${IMAGE_ROOTFS}/var/lib/jvideo/frames
     chmod 755 ${IMAGE_ROOTFS}/var/lib/jvideo/frames
-
-    # Create mount point for host share
-    install -d ${IMAGE_ROOTFS}/mnt/host
-
-    # Add to fstab for automatic mounting
-    echo "hostshare /mnt/host 9p trans=virtio,version=9p2000.L,rw,noauto 0 0" >> ${IMAGE_ROOTFS}/etc/fstab
 
     # Create a symlink for convenience
     ln -sf /mnt/host/frames ${IMAGE_ROOTFS}/var/lib/jvideo/frames-host

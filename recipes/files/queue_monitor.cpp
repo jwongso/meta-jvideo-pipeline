@@ -10,19 +10,16 @@
 #include <sstream>
 #include <iomanip>
 #include <csignal>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <cstring>
 #include <deque>
 #include <algorithm>
 #include <filesystem>
 #include <sqlite3.h>
 #include <zmq.hpp>
 #include <nlohmann/json.hpp>
+#include <numeric>
+#include <systemd/sd-daemon.h>
 
-#include "shm_services.h"
+#include "metrics_interface.h"
 
 using json = nlohmann::json;
 using namespace std::chrono;
@@ -87,46 +84,6 @@ public:
     }
 };
 
-template<typename T>
-class SharedMemoryReader {
-private:
-    std::string shm_name;
-    int fd = -1;
-    void* mapped_mem = nullptr;
-
-public:
-    SharedMemoryReader(const std::string& name) : shm_name(name) {}
-
-    ~SharedMemoryReader() { close(); }
-
-    bool open() {
-        std::string shm_path = "/dev/shm" + shm_name;
-        fd = ::open(shm_path.c_str(), O_RDONLY);
-        if (fd == -1) return false;
-
-        mapped_mem = mmap(nullptr, sizeof(T), PROT_READ, MAP_SHARED, fd, 0);
-        return mapped_mem != MAP_FAILED;
-    }
-
-    std::optional<T> read() {
-        if (!mapped_mem) return std::nullopt;
-        T data;
-        std::memcpy(&data, mapped_mem, sizeof(T));
-        return data;
-    }
-
-    void close() {
-        if (mapped_mem && mapped_mem != MAP_FAILED) {
-            munmap(mapped_mem, sizeof(T));
-            mapped_mem = nullptr;
-        }
-        if (fd != -1) {
-            ::close(fd);
-            fd = -1;
-        }
-    }
-};
-
 struct QueueStats {
     uint64_t messages = 0;
     uint64_t bytes = 0;
@@ -143,17 +100,12 @@ struct QueueStats {
         if (latencies.empty()) return 0.0;
         return std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
     }
-};
 
-struct ServiceMetrics {
-    std::string status = "unknown";
-    pid_t pid = 0;
-    double uptime = 0;
-    double current_fps = 0;
-    double db_avg_fps = 0;
-    uint64_t processed_count = 0;
-    uint64_t error_count = 0;
-    std::unordered_map<std::string, std::string> extra_info;
+    void reset_counters() {
+        if (messages > 1000000) messages = 0;
+        if (bytes > 1024 * 1024 * 1024) bytes = 0;
+        if (errors > 10000) errors = 0;
+    }
 };
 
 class DatabaseReader {
@@ -171,17 +123,29 @@ public:
         std::unordered_map<std::string, double> stats;
         sqlite3* db = nullptr;
 
+        if (!std::filesystem::exists(db_path)) {
+            stats["db_status"] = 0; // no_file
+            return stats;
+        }
+
         if (sqlite3_open_v2(db_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) {
             std::string query;
             if (service == "frame-publisher") {
                 query = "SELECT AVG(current_fps) as avg_fps, MAX(current_fps) as max_fps, "
-                       "COUNT(*) as sample_count FROM publisher_benchmarks WHERE timestamp > ?";
+                       "MIN(current_fps) as min_fps, COUNT(*) as sample_count, "
+                       "AVG(memory_usage_kb) as avg_memory_kb, MAX(errors) as max_errors "
+                       "FROM publisher_benchmarks WHERE timestamp > ?";
             } else if (service == "frame-resizer") {
-                query = "SELECT AVG(current_fps) as avg_fps, AVG(processing_time_ms) as avg_processing_ms, "
-                       "COUNT(*) as sample_count FROM resizer_benchmarks WHERE timestamp > ?";
+                query = "SELECT AVG(current_fps) as avg_fps, MAX(current_fps) as max_fps, "
+                       "MIN(current_fps) as min_fps, AVG(processing_time_ms) as avg_processing_ms, "
+                       "COUNT(*) as sample_count, MAX(errors) as max_errors "
+                       "FROM resizer_benchmarks WHERE timestamp > ?";
             } else if (service == "frame-saver") {
-                query = "SELECT AVG(current_fps) as avg_fps, AVG(save_time_ms) as avg_save_ms, "
-                       "COUNT(*) as sample_count FROM saver_benchmarks WHERE timestamp > ?";
+                query = "SELECT AVG(current_fps) as avg_fps, MAX(current_fps) as max_fps, "
+                       "MIN(current_fps) as min_fps, AVG(save_time_ms) as avg_save_ms, "
+                       "MAX(disk_usage_mb) as max_disk_mb, COUNT(*) as sample_count, "
+                       "MAX(io_errors) as max_io_errors "
+                       "FROM saver_benchmarks WHERE timestamp > ?";
             }
 
             sqlite3_stmt* stmt;
@@ -193,12 +157,19 @@ public:
                     for (int i = 0; i < cols; ++i) {
                         const char* name = sqlite3_column_name(stmt, i);
                         double value = sqlite3_column_double(stmt, i);
-                        stats[name] = value;
+                        stats[std::string("db_") + name] = value;
                     }
+                    stats["db_status"] = 1; // ok
+                } else {
+                    stats["db_status"] = 2; // no_data
                 }
                 sqlite3_finalize(stmt);
+            } else {
+                stats["db_status"] = -1; // error
             }
             sqlite3_close(db);
+        } else {
+            stats["db_status"] = -2; // unavailable
         }
 
         last_read_times[service] = now;
@@ -212,11 +183,12 @@ private:
     std::atomic<bool> running{true};
     SystemStats sys_stats;
     DatabaseReader db_reader;
+    uint64_t stats_counter = 0;
 
-    // Service readers
-    std::unique_ptr<SharedMemoryReader<PublisherSharedMetrics>> publisher_reader;
-    std::unique_ptr<SharedMemoryReader<ResizerSharedMetrics>> resizer_reader;
-    std::unique_ptr<SharedMemoryReader<SaverSharedMetrics>> saver_reader;
+    // Service readers using new metrics interface
+    std::unique_ptr<PublisherMetricsManager> publisher_reader;
+    std::unique_ptr<ResizerMetricsManager> resizer_reader;
+    std::unique_ptr<SaverMetricsManager> saver_reader;
 
     // ZMQ monitoring
     std::unique_ptr<zmq::context_t> zmq_context;
@@ -226,12 +198,13 @@ private:
     // Configuration
     struct Config {
         std::vector<int> monitor_ports = {5555, 5556};
-        int update_interval_ms = 100;
-        int display_interval_s = 1;
+        int update_interval_ms = 1000;
+        int display_interval_s = 5;
+        int db_read_interval_s = 60;
         std::unordered_map<std::string, std::string> db_paths = {
-            {"frame-publisher", "/var/log/jvideo/frame_publisher_benchmarks.db"},
-            {"frame-resizer", "/var/log/jvideo/frame_resizer_benchmarks.db"},
-            {"frame-saver", "/var/log/jvideo/frame_saver_benchmarks.db"}
+            {"frame-publisher", "/var/lib/jvideo/db/publisher_benchmarks.db"},
+            {"frame-resizer", "/var/lib/jvideo/db/resizer_benchmarks.db"},
+            {"frame-saver", "/var/lib/jvideo/db/saver_benchmarks.db"}
         };
     } config;
 
@@ -272,9 +245,17 @@ public:
                 if (j.contains("display_interval")) {
                     config.display_interval_s = j["display_interval"];
                 }
-                std::cerr << "Loaded configuration\n";
+                if (j.contains("db_read_interval")) {
+                    config.db_read_interval_s = j["db_read_interval"];
+                }
+                if (j.contains("service_db_paths")) {
+                    for (auto& [key, value] : j["service_db_paths"].items()) {
+                        config.db_paths[key] = value;
+                    }
+                }
+                std::cerr << "[Monitor] Loaded configuration\n";
             } catch (const std::exception& e) {
-                std::cerr << "Config error: " << e.what() << ", using defaults\n";
+                std::cerr << "[Monitor] Config error: " << e.what() << ", using defaults\n";
             }
         }
     }
@@ -285,13 +266,31 @@ public:
     }
 
     void initialize_services() {
-        publisher_reader = std::make_unique<SharedMemoryReader<PublisherSharedMetrics>>("/jvideo_publisher_metrics");
-        resizer_reader = std::make_unique<SharedMemoryReader<ResizerSharedMetrics>>("/jvideo_resizer_metrics");
-        saver_reader = std::make_unique<SharedMemoryReader<SaverSharedMetrics>>("/jvideo_saver_metrics");
+        std::cerr << "[Monitor] Attempting to connect to services...\n";
 
-        if (publisher_reader->open()) std::cerr << "Connected to frame-publisher\n";
-        if (resizer_reader->open()) std::cerr << "Connected to frame-resizer\n";
-        if (saver_reader->open()) std::cerr << "Connected to frame-saver\n";
+        try {
+            std::cerr << "[Monitor] Trying to open: jvideo_frame-publisher_metrics\n";
+            publisher_reader = std::make_unique<PublisherMetricsManager>("frame-publisher", true);
+            std::cerr << "[Monitor] Connected to frame-publisher shared memory\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[Monitor] Failed to connect to frame-publisher: " << e.what() << "\n";
+        }
+
+        try {
+            std::cerr << "[Monitor] Trying to open: jvideo_frame-resizer_metrics\n";
+            resizer_reader = std::make_unique<ResizerMetricsManager>("frame-resizer", true);
+            std::cerr << "[Monitor] Connected to frame-resizer shared memory\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[Monitor] Failed to connect to frame-resizer: " << e.what() << "\n";
+        }
+
+        try {
+            std::cerr << "[Monitor] Trying to open: jvideo_frame-saver_metrics\n";
+            saver_reader = std::make_unique<SaverMetricsManager>("frame-saver", true);
+            std::cerr << "[Monitor] Connected to frame-saver shared memory\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[Monitor] Failed to connect to frame-saver: " << e.what() << "\n";
+        }
     }
 
     void initialize_zmq() {
@@ -308,10 +307,10 @@ public:
 
                 zmq_sockets.emplace_back(port, std::move(socket));
                 queue_stats[port] = QueueStats{};
-                std::cerr << "Monitoring ZMQ port " << port << "\n";
+                std::cerr << "[Monitor] Monitoring ZMQ port " << port << "\n";
             }
         } catch (const std::exception& e) {
-            std::cerr << "ZMQ initialization failed: " << e.what() << "\n";
+            std::cerr << "[Monitor] ZMQ initialization failed: " << e.what() << "\n";
         }
     }
 
@@ -347,65 +346,6 @@ public:
         }
     }
 
-    ServiceMetrics get_service_metrics(const std::string& service_name) {
-        ServiceMetrics metrics;
-        auto now = time(nullptr);
-
-        if (service_name == "frame-publisher") {
-            auto data = publisher_reader->read();
-            if (data) {
-                metrics.pid = data->service_pid;
-                metrics.status = (metrics.pid > 0 && std::filesystem::exists("/proc/" + std::to_string(metrics.pid))) ? "running" : "stopped";
-                metrics.uptime = (metrics.status == "running") ? (now - data->service_start_time) : 0;
-                metrics.current_fps = data->current_fps;
-                metrics.processed_count = data->frames_published;
-                metrics.error_count = data->errors;
-                metrics.extra_info["video_path"] = std::string(data->video_path).substr(0, strlen(data->video_path));
-                metrics.extra_info["resolution"] = std::to_string(data->video_width) + "x" + std::to_string(data->video_height);
-                metrics.extra_info["video_fps"] = std::to_string(data->video_fps);
-            }
-        } else if (service_name == "frame-resizer") {
-            auto data = resizer_reader->read();
-            if (data) {
-                metrics.pid = data->service_pid;
-                metrics.status = (metrics.pid > 0 && std::filesystem::exists("/proc/" + std::to_string(metrics.pid))) ? "running" : "stopped";
-                metrics.uptime = (metrics.status == "running") ? (now - data->service_start_time) : 0;
-                metrics.current_fps = data->current_fps;
-                metrics.processed_count = data->frames_processed;
-                metrics.error_count = data->errors;
-                metrics.extra_info["dropped"] = std::to_string(data->frames_dropped);
-                metrics.extra_info["processing_time"] = std::to_string(data->processing_time_ms);
-                metrics.extra_info["input_res"] = std::to_string(data->input_width) + "x" + std::to_string(data->input_height);
-                metrics.extra_info["output_res"] = std::to_string(data->output_width) + "x" + std::to_string(data->output_height);
-            }
-        } else if (service_name == "frame-saver") {
-            auto data = saver_reader->read();
-            if (data) {
-                metrics.pid = data->service_pid;
-                metrics.status = (metrics.pid > 0 && std::filesystem::exists("/proc/" + std::to_string(metrics.pid))) ? "running" : "stopped";
-                metrics.uptime = (metrics.status == "running") ? (now - data->service_start_time) : 0;
-                metrics.current_fps = data->current_fps;
-                metrics.processed_count = data->frames_saved;
-                metrics.error_count = data->errors;
-                metrics.extra_info["dropped"] = std::to_string(data->frames_dropped);
-                metrics.extra_info["io_errors"] = std::to_string(data->io_errors);
-                metrics.extra_info["save_time"] = std::to_string(data->save_time_ms);
-                metrics.extra_info["disk_usage"] = std::to_string(data->disk_usage_mb);
-                metrics.extra_info["output_dir"] = std::string(data->output_dir).substr(0, strlen(data->output_dir));
-            }
-        }
-
-        // Get database stats
-        if (config.db_paths.count(service_name)) {
-            auto db_stats = db_reader.get_stats(service_name, config.db_paths[service_name]);
-            if (db_stats.count("avg_fps")) {
-                metrics.db_avg_fps = db_stats["avg_fps"];
-            }
-        }
-
-        return metrics;
-    }
-
     void print_status() {
         system("clear 2>/dev/null || cls 2>/dev/null");
 
@@ -421,7 +361,7 @@ public:
 
         // Queue Statistics
         if (!zmq_sockets.empty()) {
-            std::cout << "\nQueue Statistics:\n" << std::string(80, '-') << "\n";
+            std::cout << "\nQueue Statistics:\n" << std::string(80,  '-') << "\n";
             for (const auto& [port, stats] : queue_stats) {
                 std::string age = "Never";
                 if (stats.last_seen > 0) {
@@ -439,49 +379,199 @@ public:
         // Service Statistics
         std::cout << "\nService Status:\n" << std::string(80, '-') << "\n";
 
-        for (const std::string& service : {"frame-publisher", "frame-resizer", "frame-saver"}) {
-            auto metrics = get_service_metrics(service);
-
-            std::cout << "\n" << service << " [" << metrics.status << "]";
-            if (metrics.status == "running") {
-                std::cout << " PID: " << metrics.pid << " | Uptime: " << (metrics.uptime / 60) << " min\n";
-                std::cout << "  Current FPS: " << std::setprecision(1) << metrics.current_fps
-                          << " | Avg FPS (10m): " << metrics.db_avg_fps << "\n";
-
-                if (service == "frame-publisher") {
-                    std::cout << "  Published: " << metrics.processed_count << " frames | Errors: " << metrics.error_count << "\n";
-                    std::cout << "  Video: " << std::filesystem::path(metrics.extra_info["video_path"]).filename().string() << "\n";
-                    std::cout << "  Resolution: " << metrics.extra_info["resolution"] << " @ " << metrics.extra_info["video_fps"] << " fps\n";
-                } else if (service == "frame-resizer") {
-                    std::cout << "  Processed: " << metrics.processed_count << " | Dropped: " << metrics.extra_info["dropped"] << " | Errors: " << metrics.error_count << "\n";
-                    std::cout << "  Processing time: " << metrics.extra_info["processing_time"] << " ms\n";
-                    std::cout << "  Input: " << metrics.extra_info["input_res"] << " -> Output: " << metrics.extra_info["output_res"] << "\n";
-                } else if (service == "frame-saver") {
-                    std::cout << "  Saved: " << metrics.processed_count << " | Dropped: " << metrics.extra_info["dropped"] << " | IO Errors: " << metrics.extra_info["io_errors"] << "\n";
-                    std::cout << "  Save time: " << metrics.extra_info["save_time"] << " ms | Disk usage: " << metrics.extra_info["disk_usage"] << " MB\n";
-                    std::cout << "  Output: " << metrics.extra_info["output_dir"] << "\n";
-                }
-            } else {
-                std::cout << "\n";
-            }
-        }
+        print_service_status("frame-publisher");
+        print_service_status("frame-resizer");
+        print_service_status("frame-saver");
 
         std::cout << "\n" << std::string(80, '=') << "\n";
         std::cout << "Press Ctrl+C to exit\n";
     }
 
+    void print_service_status(const std::string& service) {
+        auto now = time(nullptr);
+
+        if (service == "frame-publisher" && publisher_reader) {
+            try {
+                auto data = publisher_reader->getMetrics();
+
+                std::cerr << "[DEBUG] Publisher PID from metrics: " << data.service_pid << std::endl;
+                std::cerr << "[DEBUG] Publisher last update: " << (time(nullptr) - data.last_update_time / 1000000000) << " seconds ago" << std::endl;
+
+                bool is_running = data.service_pid > 0 &&
+                                std::filesystem::exists("/proc/" + std::to_string(data.service_pid));
+
+                std::cout << "\n" << service << " [" << (is_running ? "running" : "stopped") << "]";
+
+                if (is_running) {
+                    double uptime = (now - data.service_start_time / 1000000000) / 60.0;
+
+                    auto db_stats = db_reader.get_stats(service, config.db_paths[service]);
+                    double db_avg_fps = db_stats.count("db_avg_fps") ? db_stats["db_avg_fps"] : 0.0;
+
+                    std::cout << " PID: " << data.service_pid << " | Uptime: "
+                            << std::fixed << std::setprecision(0) << uptime << " min\n";
+                    std::cout << "  Current FPS: " << std::setprecision(1) << data.current_fps
+                            << " | Avg FPS (10m): " << db_avg_fps << "\n";
+
+                    if (data.total_frames == 0) {
+                        std::cout << "  Published: " << data.frames_published << " frames";
+                    } else {
+                        std::cout << "  Published: " << data.frames_published << "/" << data.total_frames << " frames";
+                    }
+                    std::cout << " | Errors: " << data.errors << "\n";
+
+                    if (!data.video_path.empty() && data.video_path != "FILE_NOT_FOUND" && data.video_path != "OPEN_FAILED") {
+                        std::cout << "  Video: " << std::filesystem::path(data.video_path).filename().string() << "\n";
+                    }
+                    std::cout << "  Resolution: " << data.video_width << "x" << data.video_height
+                            << " @ " << std::setprecision(1) << data.video_fps << " fps\n";
+
+                    // Database status
+                    double db_status = db_stats.count("db_status") ? db_stats["db_status"] : -1;
+                    if (db_status == 1) {
+                        double samples = db_stats.count("db_sample_count") ? db_stats["db_sample_count"] : 0;
+                        std::cout << "  DB: " << std::fixed << std::setprecision(0) << samples
+                                << " samples in last 10 min\n";
+                    } else {
+                        std::cout << "  DB: " << (db_status == 0 ? "no_file" : "unavailable") << "\n";
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::cout << "\n" << service << " [error reading metrics]\n";
+            }
+        }
+        else if (service == "frame-resizer" && resizer_reader) {
+            try {
+                auto data = resizer_reader->getMetrics();
+
+                bool is_running = data.service_pid > 0 &&
+                                std::filesystem::exists("/proc/" + std::to_string(data.service_pid));
+
+                std::cout << "\n" << service << " [" << (is_running ? "running" : "stopped") << "]";
+
+                if (is_running) {
+                    double uptime = (now - data.service_start_time / 1000000000) / 60.0;
+
+                    auto db_stats = db_reader.get_stats(service, config.db_paths[service]);
+                    double db_avg_fps = db_stats.count("db_avg_fps") ? db_stats["db_avg_fps"] : 0.0;
+
+                    std::cout << " PID: " << data.service_pid << " | Uptime: "
+                            << std::fixed << std::setprecision(0) << uptime << " min\n";
+                    std::cout << "  Current FPS: " << std::setprecision(1) << data.current_fps
+                            << " | Avg FPS (10m): " << db_avg_fps << "\n";
+                    std::cout << "  Processed: " << data.frames_processed
+                            << " | Dropped: " << data.frames_dropped
+                            << " | Errors: " << data.errors << "\n";
+                    std::cout << "  Processing time: " << data.processing_time_ms << " ms\n";
+                    std::cout << "  Input: " << data.input_width << "x" << data.input_height
+                            << " -> Output: " << data.output_width << "x" << data.output_height << "\n";
+
+                    // Database status
+                    double db_status = db_stats.count("db_status") ? db_stats["db_status"] : -1;
+                    if (db_status == 1) {
+                        double samples = db_stats.count("db_sample_count") ? db_stats["db_sample_count"] : 0;
+                        std::cout << "  DB: " << std::fixed << std::setprecision(0) << samples
+                                << " samples in last 10 min\n";
+                    } else {
+                        std::cout << "  DB: " << (db_status == 0 ? "no_file" : "unavailable") << "\n";
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::cout << "\n" << service << " [error reading metrics]\n";
+            }
+        }
+        else if (service == "frame-saver" && saver_reader) {
+            try {
+                auto data = saver_reader->getMetrics();
+
+                bool is_running = data.service_pid > 0 &&
+                                std::filesystem::exists("/proc/" + std::to_string(data.service_pid));
+
+                std::cout << "\n" << service << " [" << (is_running ? "running" : "stopped") << "]";
+
+                if (is_running) {
+                    double uptime = (now - data.service_start_time / 1000000000) / 60.0;
+
+                    auto db_stats = db_reader.get_stats(service, config.db_paths[service]);
+                    double db_avg_fps = db_stats.count("db_avg_fps") ? db_stats["db_avg_fps"] : 0.0;
+
+                    std::cout << " PID: " << data.service_pid << " | Uptime: "
+                            << std::fixed << std::setprecision(0) << uptime << " min\n";
+                    std::cout << "  Current FPS: " << std::setprecision(1) << data.current_fps
+                            << " | Avg FPS (10m): " << db_avg_fps << "\n";
+                    std::cout << "  Saved: " << data.frames_saved
+                            << " | Dropped: " << data.frames_dropped
+                            << " | IO Errors: " << data.io_errors << "\n";
+                    std::cout << "  Save time: " << data.save_time_ms
+                            << " ms | Disk usage: " << data.disk_usage_mb << " MB\n";
+
+                    if (!data.output_dir.empty()) {
+                        std::cout << "  Output: " << data.output_dir << "\n";
+                    }
+
+                    // Database status
+                    double db_status = db_stats.count("db_status") ? db_stats["db_status"] : -1;
+                    if (db_status == 1) {
+                        double samples = db_stats.count("db_sample_count") ? db_stats["db_sample_count"] : 0;
+                        std::cout << "  DB: " << std::fixed << std::setprecision(0) << samples
+                                << " samples in last 10 min\n";
+                    } else {
+                        std::cout << "  DB: " << (db_status == 0 ? "no_file" : "unavailable") << "\n";
+                    }
+
+                    if (data.tracked_frames > 0) {
+                        std::cout << "\n  Frame Pipeline Tracking:\n";
+                        std::cout << "    End-to-End Latency: "
+                                << std::fixed << std::setprecision(1)
+                                << data.avg_total_latency_ms << "ms"
+                                << " (min: " << data.min_total_latency_ms << "ms"
+                                << ", max: " << data.max_total_latency_ms << "ms)\n";
+                        std::cout << "    Stage Breakdown:\n";
+                        std::cout << "      - Read→Publish: " << data.avg_publish_latency_ms << "ms\n";
+                        std::cout << "      - Publish→Resize: " << data.avg_resize_latency_ms << "ms\n";
+                        std::cout << "      - Resize→Save: " << data.avg_save_latency_ms << "ms\n";
+                        std::cout << "    Tracked Frames: " << data.tracked_frames << "\n";
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::cout << "\n" << service << " [error reading metrics]\n";
+            }
+        } else {
+            std::cout << "\n" << service << " [not connected]\n";
+        }
+    }
+
+    void cleanup_stats() {
+        for (auto& [port, stats] : queue_stats) {
+            stats.reset_counters();
+        }
+    }
+
     void run() {
-        std::cerr << "Starting monitoring loop...\n";
+        std::cerr << "[Monitor] Starting monitoring loop...\n";
 
         auto last_display = steady_clock::now();
+        auto last_watchdog = steady_clock::now();
+        const auto watchdog_interval = std::chrono::seconds(10);
 
         while (running) {
             check_zmq_queues();
 
             auto now = steady_clock::now();
+
+            if (duration_cast<seconds>(now - last_watchdog) >= watchdog_interval) {
+                sd_notify(0, "WATCHDOG=1");
+                last_watchdog = now;
+            }
+
             if (duration_cast<seconds>(now - last_display).count() >= config.display_interval_s) {
                 print_status();
                 last_display = now;
+            }
+
+            // Periodic cleanup
+            if (++stats_counter % 20 == 0) {
+                cleanup_stats();
             }
 
             std::this_thread::sleep_for(milliseconds(config.update_interval_ms));
@@ -491,10 +581,10 @@ public:
     }
 
     void cleanup() {
-        std::cerr << "\nCleaning up...\n";
+        std::cerr << "\n[Monitor] Cleaning up...\n";
         zmq_sockets.clear();
         zmq_context.reset();
-        std::cerr << "Shutdown complete\n";
+        std::cerr << "[Monitor] Shutdown complete\n";
     }
 };
 
@@ -505,7 +595,7 @@ int main() {
         QueueMonitor monitor;
         monitor.run();
     } catch (const std::exception& e) {
-        std::cerr << "Fatal error: " << e.what() << "\n";
+        std::cerr << "[Monitor] Fatal error: " << e.what() << "\n";
         return 1;
     }
     return 0;

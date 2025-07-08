@@ -87,7 +87,7 @@ class ServiceMetricsCollector:
     def __init__(self, config):
         self.config = config
 
-        # Service configurations matching C++ structs
+        # Service configurations matching C++ structs with tracking
         self.services = {
             'frame-publisher': {
                 'shm_name': '/jvideo_publisher_metrics',
@@ -95,23 +95,24 @@ class ServiceMetricsCollector:
                     'frame-publisher',
                     '/var/lib/jvideo/db/publisher_benchmarks.db'
                 ),
-                # PublisherSharedMetrics structure
-                'struct_format': '64s I QQQ dd ii ? 256s qq 64s',
+                # PublisherSharedMetrics structure - with 4-byte padding after pid
+                'struct_format': '64s I 4x QQQ dd ii ? 256s qq 53s',
                 'fields': [
                     'service_name',      # char[64]
-                    'service_pid',       # pid_t (int)
+                    'service_pid',       # pid_t (4 bytes)
+                    # 4 bytes padding (4x)
                     'frames_published',  # uint64_t
                     'total_frames',      # uint64_t
                     'errors',            # uint64_t
                     'current_fps',       # double
                     'video_fps',         # double
-                    'video_width',       # int
-                    'video_height',      # int
+                    'video_width',       # int32_t
+                    'video_height',      # int32_t
                     'video_healthy',     # bool
                     'video_path',        # char[256]
-                    'last_update_time',  # time_t
-                    'service_start_time',# time_t
-                    '_padding'           # char[64]
+                    'last_update_time',  # int64_t
+                    'service_start_time',# int64_t
+                    '_padding'           # char[53]
                 ]
             },
             'frame-resizer': {
@@ -120,24 +121,25 @@ class ServiceMetricsCollector:
                     'frame-resizer',
                     '/var/lib/jvideo/db/resizer_benchmarks.db'
                 ),
-                # ResizerSharedMetrics structure
-                'struct_format': '64s I QQQ dd iiii ? qq 64s',
+                # ResizerSharedMetrics structure - with 4-byte padding after pid
+                'struct_format': '64s I 4x QQQ dd iiii ? qq 53s',
                 'fields': [
                     'service_name',      # char[64]
-                    'service_pid',       # pid_t
+                    'service_pid',       # pid_t (4 bytes)
+                    # 4 bytes padding (4x)
                     'frames_processed',  # uint64_t
                     'frames_dropped',    # uint64_t
                     'errors',            # uint64_t
                     'current_fps',       # double
                     'processing_time_ms',# double
-                    'input_width',       # int
-                    'input_height',      # int
-                    'output_width',      # int
-                    'output_height',     # int
+                    'input_width',       # int32_t
+                    'input_height',      # int32_t
+                    'output_width',      # int32_t
+                    'output_height',     # int32_t
                     'service_healthy',   # bool
-                    'last_update_time',  # time_t
-                    'service_start_time',# time_t
-                    '_padding'           # char[64]
+                    'last_update_time',  # int64_t
+                    'service_start_time',# int64_t
+                    '_padding'           # char[53]
                 ]
             },
             'frame-saver': {
@@ -146,31 +148,38 @@ class ServiceMetricsCollector:
                     'frame-saver',
                     '/var/lib/jvideo/db/saver_benchmarks.db'
                 ),
-                # SaverSharedMetrics structure
-                'struct_format': '64s I QQQQ ddd iii ? 256s 16s qq 64s',
+                # SaverSharedMetrics structure - with 4-byte padding after pid
+                'struct_format': '64s I 4x QQQQ ddd iii ? 256s 16s qq ddddddQ 53s',
                 'fields': [
-                    'service_name',      # char[64]
-                    'service_pid',       # pid_t
-                    'frames_saved',      # uint64_t
-                    'frames_dropped',    # uint64_t
-                    'errors',            # uint64_t
-                    'io_errors',         # uint64_t
-                    'current_fps',       # double
-                    'save_time_ms',      # double
-                    'disk_usage_mb',     # double
-                    'frame_width',       # int
-                    'frame_height',      # int
-                    'frame_channels',    # int
-                    'disk_healthy',      # bool
-                    'output_dir',        # char[256]
-                    'format',            # char[16]
-                    'last_update_time',  # time_t
-                    'service_start_time',# time_t
-                    '_padding'           # char[64]
+                    'service_name',           # char[64]
+                    'service_pid',            # pid_t (4 bytes)
+                    # 4 bytes padding (4x)
+                    'frames_saved',           # uint64_t
+                    'frames_dropped',         # uint64_t
+                    'errors',                 # uint64_t
+                    'io_errors',              # uint64_t
+                    'current_fps',            # double
+                    'save_time_ms',           # double
+                    'disk_usage_mb',          # double
+                    'frame_width',            # int32_t
+                    'frame_height',           # int32_t
+                    'frame_channels',        # int32_t
+                    'disk_healthy',          # bool
+                    'output_dir',            # char[256]
+                    'format',                # char[16]
+                    'last_update_time',      # int64_t
+                    'service_start_time',    # int64_t
+                    'avg_total_latency_ms',  # double
+                    'min_total_latency_ms',  # double
+                    'max_total_latency_ms',  # double
+                    'avg_publish_latency_ms',# double
+                    'avg_resize_latency_ms', # double
+                    'avg_save_latency_ms',   # double
+                    'tracked_frames',        # uint64_t
+                    '_padding'               # char[53]
                 ]
             }
         }
-
         self.shm_readers = {}
         self.last_db_read = {}
         self._db_stats_cache = {}
@@ -198,12 +207,14 @@ class ServiceMetricsCollector:
 
             # Check if service is running
             pid = shm_data.get('service_pid', 0)
-            is_running = pid > 0 and os.path.exists(f'/proc/{pid}')
+            is_running = pid > 0 and pid < 100000 and os.path.exists(f'/proc/{pid}')
 
             # Calculate uptime
             uptime = 0
             if is_running and 'service_start_time' in shm_data:
-                uptime = time.time() - shm_data['service_start_time']
+                start_time = shm_data['service_start_time']
+                if start_time > 0 and start_time < time.time():
+                    uptime = time.time() - start_time
 
             # Get database stats
             db_stats = self._get_db_stats(service_name)
@@ -340,9 +351,9 @@ class QueueMonitor:
             'display_interval': 5,
             'db_read_interval': 60,
             'service_db_paths': {
-                'frame-publisher': '/var/log/jvideo/frame_publisher_benchmarks.db',
-                'frame-resizer': '/var/log/jvideo/frame_resizer_benchmarks.db',
-                'frame-saver': '/var/log/jvideo/frame_saver_benchmarks.db'
+                'frame-publisher': '/var/lib/jvideo/db/publisher_benchmarks.db',
+                'frame-resizer': '/var/lib/jvideo/db/resizer_benchmarks.db',
+                'frame-saver': '/var/lib/jvideo/db/saver_benchmarks.db'
             }
         }
 
@@ -574,6 +585,26 @@ class QueueMonitor:
                     lines.append(f"  Saved: {saved} | Dropped: {dropped} | IO Errors: {io_errors}")
                     lines.append(f"  Save time: {save_time:.1f} ms | Disk usage: {disk_mb:.1f} MB")
                     lines.append(f"  Output: {info.get('output_dir', 'unknown')}")
+
+                    # Add frame pipeline tracking for frame-saver
+                    tracked_frames = info.get('tracked_frames', 0)
+                    if tracked_frames >= 0:
+                        avg_total = info.get('avg_total_latency_ms', 0)
+                        min_total = info.get('min_total_latency_ms', 0)
+                        max_total = info.get('max_total_latency_ms', 0)
+                        avg_publish = info.get('avg_publish_latency_ms', 0)
+                        avg_resize = info.get('avg_resize_latency_ms', 0)
+                        avg_save = info.get('avg_save_latency_ms', 0)
+
+                        lines.append("")
+                        lines.append("  Frame Pipeline Tracking:")
+                        lines.append(f"    End-to-End Latency: {avg_total:.1f}ms "
+                                    f"(min: {min_total:.1f}ms, max: {max_total:.1f}ms)")
+                        lines.append("    Stage Breakdown:")
+                        lines.append(f"      - Read→Publish: {avg_publish:.1f}ms")
+                        lines.append(f"      - Publish→Resize: {avg_resize:.1f}ms")
+                        lines.append(f"      - Resize→Save: {avg_save:.1f}ms")
+                        lines.append(f"    Tracked Frames: {tracked_frames}")
 
                 # Database stats
                 db_status = info.get('db_status', 'unknown')

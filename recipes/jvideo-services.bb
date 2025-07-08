@@ -1,5 +1,5 @@
 SUMMARY = "Juni's Video Pipeline Services"
-DESCRIPTION = "Video processing microservices using ZeroMQ, SharedMemory and SQLite - Python, C++, and Rust implementations"
+DESCRIPTION = "Video processing microservices using ZeroMQ, Boost.Interprocess, MessagePack and SQLite - Python, C++, and Rust implementations"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
@@ -15,9 +15,12 @@ DEPENDS = " \
     rust-native \
     nlohmann-json \
     sqlite3 \
+    boost \
+    msgpack-c \
+    msgpack-cpp \
     "
 
-# Runtime dependencies - Removed Redis, added SQLite and SHM utils
+# Runtime dependencies
 RDEPENDS:${PN} = " \
     python3-core \
     python3-pyzmq \
@@ -39,6 +42,8 @@ RDEPENDS:${PN} = " \
     libavcodec \
     libavformat \
     libavutil \
+    boost \
+    msgpack-c \
     "
 
 # Source files - Added new files
@@ -54,12 +59,15 @@ SRC_URI = " \
     file://frame_saver.cpp \
     file://queue_monitor.py \
     file://queue_monitor.cpp \
-    file://shm_services.h \
+    file://metrics_interface.h \
+    file://frame_tracking.h \
+    file://pipeline_stage.h \
     file://CMakeLists.txt \
     file://frame-publisher.conf \
     file://frame-resizer.conf \
     file://frame-saver.conf \
     file://queue-monitor.conf \
+    file://jvideo-dashboard.sh \
     file://jvideo-frame-publisher-python.service \
     file://jvideo-frame-publisher-cpp.service \
     file://jvideo-frame-publisher-rust.service \
@@ -267,10 +275,8 @@ do_install() {
     echo 'exec /usr/bin/python3 /opt/jvideo/services/service_controller.py "$@"' >> ${D}/usr/bin/jvideo-control
     chmod 0755 ${D}/usr/bin/jvideo-control
 
-    # Create dashboard script for direct access to queue monitor
-    echo '#!/bin/bash' > ${D}/usr/bin/jvideo-dashboard
-    echo 'exec /opt/jvideo/bin/queue-monitor-cpp "$@"' >> ${D}/usr/bin/jvideo-dashboard
-    chmod 0755 ${D}/usr/bin/jvideo-dashboard
+    # Install dashboard launcher script
+    install -m 0755 ${S}/jvideo-dashboard.sh ${D}/usr/bin/jvideo-dashboard
 }
 
 FILES:${PN} += " \

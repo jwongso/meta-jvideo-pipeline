@@ -1,6 +1,6 @@
 [Unit]
 Description=Juni's Frame Saver Service (C++)
-After=network.target redis.service
+After=network.target
 Conflicts=jvideo-frame-saver-python.service
 
 [Service]

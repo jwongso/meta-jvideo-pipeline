@@ -10,12 +10,6 @@ import logging
 from pathlib import Path
 from datetime import datetime
 
-try:
-    import redis
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
-
 class ServiceController:
     """Controls video pipeline services via systemd"""
 
@@ -43,17 +37,6 @@ class ServiceController:
                 'default': 'cpp'
             }
         }
-
-        # Setup Redis if available
-        self.redis = None
-        if REDIS_AVAILABLE:
-            try:
-                self.redis = redis.Redis(host='localhost', decode_responses=True)
-                self.redis.ping()
-                self.logger.info("Redis connection established")
-            except Exception as e:
-                self.logger.warning(f"Redis not available: {e}")
-                self.redis = None
 
     def setup_logging(self):
         """Setup logging"""
@@ -151,18 +134,6 @@ class ServiceController:
 
         if success:
             self.logger.info(f"Successfully switched {service} to {new_lang}")
-
-            # Update Redis if available
-            if self.redis:
-                try:
-                    self.redis.hset(f'service:{service}', mapping={
-                        'language': new_lang,
-                        'unit': new_unit,
-                        'switched_at': datetime.now().isoformat()
-                    })
-                except:
-                    pass
-
             return True
         else:
             self.logger.error(f"Failed to start {new_unit}: {stderr}")
@@ -214,11 +185,6 @@ class ServiceController:
 
         if success:
             self.logger.info(f"Successfully stopped {service}")
-            if self.redis:
-                try:
-                    self.redis.hset(f'service:{service}', 'status', 'stopped')
-                except:
-                    pass
             return True
         else:
             self.logger.error(f"Failed to stop {unit}: {stderr}")
@@ -305,26 +271,27 @@ class ServiceController:
             return False
 
     def monitor_services(self):
-        """Monitor services and update Redis"""
+        """Monitor services continuously"""
+        self.logger.info("Starting service monitoring (Ctrl+C to stop)...")
+
         while True:
             try:
                 status = self.get_status()
 
-                # Update Redis with current status
-                if self.redis:
-                    try:
-                        self.redis.set('controller:status', json.dumps(status), ex=30)
-                        self.redis.set('controller:last_update', datetime.now().isoformat())
-                    except:
-                        pass
-
-                # Log status
+                # Log status periodically
                 active_services = [s for s, info in status.items() if info['active']]
                 self.logger.debug(f"Active services: {', '.join(active_services)}")
+
+                # Check for failed services and potentially restart them
+                for service, info in status.items():
+                    if info['active'] and info.get('substate') == 'failed':
+                        self.logger.warning(f"Service {service} is in failed state")
+                        # Could add auto-restart logic here if needed
 
                 time.sleep(10)
 
             except KeyboardInterrupt:
+                self.logger.info("Monitoring stopped by user")
                 break
             except Exception as e:
                 self.logger.error(f"Error in monitor loop: {e}")
@@ -453,7 +420,6 @@ def main():
                 sys.exit(1)
 
         elif command == 'monitor':
-            print("Starting service monitor (Ctrl+C to stop)...")
             controller.monitor_services()
 
         else:

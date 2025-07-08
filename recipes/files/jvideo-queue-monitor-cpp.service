@@ -1,6 +1,6 @@
 [Unit]
 Description=Juni's Queue Monitor Service (C++)
-Wants=redis.service
+After=network.target
 Conflicts=jvideo-queue-monitor-python.service
 
 [Service]

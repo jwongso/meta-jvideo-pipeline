@@ -1,7 +1,6 @@
 [Unit]
 Description=Juni's Queue Monitor Service (Python)
-After=network.target redis.service
-Wants=redis.service
+After=network.target
 Conflicts=jvideo-queue-monitor-cpp.service
 
 [Service]
