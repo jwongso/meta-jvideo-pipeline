@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <msgpack.hpp>
+#include "logger.h"
 
 // Base metrics - all services have these
 struct BaseMetrics {
@@ -104,12 +105,14 @@ public:
 
         fd = open(shm_path.c_str(), O_RDWR | O_CREAT, 0644);
         if (fd < 0) {
+            LOG_ERROR("MetricsManager", "Failed to create shared memory: " + std::string(strerror(errno)));
             throw std::runtime_error("Failed to create shared memory: " + std::string(strerror(errno)));
         }
 
         if (ftruncate(fd, memory_size) < 0) {
             close(fd);
-            throw std::runtime_error("Failed to resize shared memory: " + std::string(strerror(errno)));
+            LOG_ERROR("MetricsManager", "Failed to create shared memory: " + std::string(strerror(errno)));
+            throw std::runtime_error("Failed to create shared memory: " + std::string(strerror(errno)));
         }
 
         mapped_memory = mmap(nullptr, memory_size, PROT_READ | PROT_WRITE,
@@ -117,6 +120,7 @@ public:
 
         if (mapped_memory == MAP_FAILED) {
             close(fd);
+            LOG_ERROR("MetricsManager", "Failed to map shared memory: " + std::string(strerror(errno)));
             throw std::runtime_error("Failed to map shared memory: " + std::string(strerror(errno)));
         }
 
@@ -136,12 +140,14 @@ public:
 
         fd = open(shm_path.c_str(), read_only ? O_RDONLY : O_RDWR);
         if (fd < 0) {
+            LOG_ERROR("MetricsManager", "Failed to open shared memory: " + std::string(strerror(errno)));
             throw std::runtime_error("Failed to open shared memory file: " + std::string(strerror(errno)));
         }
 
         struct stat sb;
         if (fstat(fd, &sb) < 0) {
             close(fd);
+            LOG_ERROR("MetricsManager", "Failed to get file size: " + std::string(strerror(errno)));
             throw std::runtime_error("Failed to get file size: " + std::string(strerror(errno)));
         }
         memory_size = sb.st_size;
@@ -151,6 +157,7 @@ public:
                            MAP_SHARED, fd, 0);
         if (mapped_memory == MAP_FAILED) {
             close(fd);
+            LOG_ERROR("MetricsManager", "Failed to map shared memory: " + std::string(strerror(errno)));
             throw std::runtime_error("Failed to map shared memory: " + std::string(strerror(errno)));
         }
 
@@ -180,6 +187,7 @@ public:
     template<typename T>
     void updateMetric(const std::string& key, T value) {
         if (!is_owner) {
+            LOG_ERROR("MetricsManager", "Cannot update metrics as non-owner");
             throw std::runtime_error("Cannot update metrics as non-owner");
         }
 
@@ -203,6 +211,7 @@ public:
     // Direct access to local metrics for owner
     MetricsType& metrics() {
         if (!is_owner) {
+            LOG_ERROR("MetricsManager", "Direct metrics access only available for owner");
             throw std::runtime_error("Direct metrics access only available for owner");
         }
         return local_metrics;
@@ -215,6 +224,7 @@ public:
                 std::chrono::system_clock::now().time_since_epoch().count();
             updateSharedMemory();
         } else {
+            LOG_ERROR("MetricsManager", "Cannot commit metrics as non-owner");
             throw std::runtime_error("Cannot commit metrics as non-owner");
         }
     }
@@ -222,6 +232,7 @@ public:
     // Write metrics to shared memory
     void updateSharedMemory() {
         if (!is_owner) {
+            LOG_ERROR("MetricsManager", "Cannot update shared memory as non-owner");
             throw std::runtime_error("Cannot update shared memory as non-owner");
         }
 
@@ -231,6 +242,7 @@ public:
 
         // Lock file
         if (flock(fd, LOCK_EX) != 0) {
+            LOG_ERROR("MetricsManager", "Failed to acquire write lock: " + std::string(strerror(errno)));
             throw std::runtime_error("Failed to acquire write lock: " + std::string(strerror(errno)));
         }
 
@@ -257,6 +269,7 @@ public:
 
         // Lock for reading
         if (flock(fd, LOCK_SH) != 0) {
+            LOG_ERROR("MetricsManager", "Failed to acquire read lock: " + std::string(strerror(errno)));
             throw std::runtime_error("Failed to acquire read lock: " + std::string(strerror(errno)));
         }
 
@@ -266,6 +279,7 @@ public:
             memcpy(&data_size, static_cast<char*>(mapped_memory) + 64, sizeof(data_size));
 
             if (data_size == 0 || data_size > memory_size - 72) {
+                LOG_ERROR("MetricsManager", "Invalid data size in shared memory: " + std::to_string(data_size));
                 throw std::runtime_error("Invalid data size in shared memory: " + std::to_string(data_size));
             }
 
@@ -278,9 +292,11 @@ public:
             obj.convert(metrics);
         } catch (const std::exception& e) {
             flock(fd, LOCK_UN);  // Ensure lock is released on error
+            LOG_ERROR("MetricsManager", "Failed to read metrics: " + std::string(e.what()));
             throw std::runtime_error("Failed to read metrics: " + std::string(e.what()));
         } catch (...) {
             flock(fd, LOCK_UN);  // Ensure lock is released on error
+            LOG_ERROR("MetricsManager", "Unknown error reading metrics");
             throw std::runtime_error("Unknown error reading metrics");
         }
 

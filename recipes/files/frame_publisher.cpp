@@ -6,6 +6,7 @@
 class MP4FramePublisher : public PublisherStage {
 private:
     static constexpr const char* DEFAULT_VIDEO_PATH = "/usr/share/jvideo/media/matterhorn.mp4";
+    static constexpr const char* SERVICE_NAME = "FramePublisher";
 
     zmq::context_t zmq_context_;
     zmq::socket_t zmq_socket_;
@@ -29,6 +30,8 @@ public:
         }
         zmq_socket_.close();
         zmq_context_.close();
+
+        LOG_INFO(SERVICE_NAME, "MP4FramePublisher destroyed");
     }
 
 protected:
@@ -50,7 +53,7 @@ protected:
         int port = config_["publish_port"];
         std::string bind_addr = "tcp://*:" + std::to_string(port);
         zmq_socket_.bind(bind_addr);
-        std::cout << "[Publisher] ZMQ socket bound to " << bind_addr << std::endl;
+        LOG_INFO(SERVICE_NAME, "ZMQ socket bound to " + bind_addr);
 
         // Give subscribers time to connect
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -58,6 +61,7 @@ protected:
         // Open video
         std::string video_path = config_["video_input_path"];
         if (!openVideo(video_path)) {
+            LOG_FATAL(SERVICE_NAME, "Failed to open video: " + video_path);
             throw std::runtime_error("Failed to open video: " + video_path);
         }
 
@@ -65,6 +69,8 @@ protected:
         loop_video_ = config_["loop_video"];
         jpeg_quality_ = config_["jpeg_quality"];
         frame_delay_ms_ = config_["frame_delay_ms"];
+
+        LOG_INFO(SERVICE_NAME, "Service started successfully");
     }
 
     bool processFrame() override {
@@ -77,12 +83,12 @@ protected:
         // Read frame
         if (!video_cap_.read(frame) || frame.empty()) {
             if (loop_video_) {
-                std::cout << "[Publisher] End of video, restarting..." << std::endl;
+                LOG_INFO(SERVICE_NAME, "End of video, restarting...");
                 video_cap_.set(cv::CAP_PROP_POS_FRAMES, 0);
                 frame_counter_ = 0;
                 return true; // Continue processing
             } else {
-                std::cout << "[Publisher] End of video reached. Exiting..." << std::endl;
+                LOG_INFO(SERVICE_NAME, "End of video reached. Exiting...");
                 stop();
                 return false;
             }
@@ -129,6 +135,10 @@ protected:
 
         frames_processed_++;
 
+        if (frames_processed_ % 100 == 0) {
+            LOG_DEBUG(SERVICE_NAME, "Processed " + std::to_string(frames_processed_) + " frames");
+        }
+
         // Update metrics
         updateMetrics();
 
@@ -147,10 +157,10 @@ protected:
 
 private:
     bool openVideo(const std::string& video_path) {
-        std::cout << "[Publisher] Opening video: " << video_path << std::endl;
+        LOG_INFO(SERVICE_NAME, "Opening video: " + video_path);
 
         if (!video_cap_.open(video_path)) {
-            std::cerr << "[Publisher] Failed to open video: " << video_path << std::endl;
+            LOG_ERROR(SERVICE_NAME, "Failed to open video: " + video_path);
             return false;
         }
 
@@ -164,10 +174,10 @@ private:
             frame_count = 0;
         }
 
-        std::cout << "[Publisher] Video opened successfully:" << std::endl;
-        std::cout << "  Resolution: " << width << "x" << height << std::endl;
-        std::cout << "  Frames: " << (frame_count > 0 ? std::to_string(frame_count) : "unknown") << std::endl;
-        std::cout << "  FPS: " << fps << std::endl;
+        LOG_INFO(SERVICE_NAME, "Video opened successfully:");
+        LOG_INFO(SERVICE_NAME, "  Resolution: " + std::to_string(width) + "x" + std::to_string(height));
+        LOG_INFO(SERVICE_NAME, "  Frames: " + (frame_count > 0 ? std::to_string(frame_count) : "unknown"));
+        LOG_INFO(SERVICE_NAME, "  FPS: " + std::to_string(fps));
 
         // Update metrics
         auto& metrics = metrics_mgr_->metrics();
@@ -184,17 +194,21 @@ private:
 };
 
 int main(int argc, char* argv[]) {
-    std::cout << "[Publisher] MP4 Frame Publisher starting..." << std::endl;
-    std::cout << "[Publisher] PID: " << getpid() << std::endl;
+    // Initialize logger early
+    Logger::getInstance().setLevel(Logger::LogLevel::INFO);
+    Logger::getInstance().setOutputMode(Logger::OutputMode::BOTH);
+
+    LOG_INFO("Main", "MP4 Frame Publisher starting...");
+    LOG_INFO("Main", "PID: " + std::to_string(getpid()));
 
     try {
         MP4FramePublisher publisher;
         publisher.run();
     } catch (const std::exception& e) {
-        std::cerr << "[Publisher] Fatal error: " << e.what() << std::endl;
+        LOG_FATAL("Main", "Fatal error: " + std::string(e.what()));
         return 1;
     }
 
-    std::cout << "[Publisher] Shutdown complete" << std::endl;
+    LOG_INFO("Main", "Shutdown complete");
     return 0;
 }

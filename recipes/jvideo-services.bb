@@ -59,6 +59,7 @@ SRC_URI = " \
     file://metrics_interface.h \
     file://frame_tracking.h \
     file://pipeline_stage.h \
+    file://logger.h \
     file://pipeline_stage.py \
     file://CMakeLists.txt \
     file://frame-publisher.conf \
@@ -178,7 +179,7 @@ do_install() {
     echo 'exec /usr/bin/python3 /opt/jvideo/services/service_controller.py "$@"' >> ${D}/usr/bin/jvideo-control
     chmod 0755 ${D}/usr/bin/jvideo-control
 
-    install -m 0755 ${S}/jvideo-dashboard.sh ${D}/opt/jvideo/bin/
+    install -m 0755 ${S}/jvideo-dashboard.sh ${D}/usr/bin/
 }
 
 FILES:${PN} += " \

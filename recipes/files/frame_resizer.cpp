@@ -24,9 +24,11 @@ public:
     }
 
     ~FrameResizer() {
+        LOG_DEBUG(service_name_, "Shutting down FrameResizer");
         sub_socket_.close();
         pub_socket_.close();
         zmq_context_.close();
+        LOG_DEBUG(service_name_, "ZMQ resources cleaned up");
     }
 
 protected:
@@ -41,6 +43,8 @@ protected:
     }
 
     void onStart() override {
+        LOG_INFO(service_name_, "Starting FrameResizer initialization");
+
         // Configure sockets
         sub_socket_.set(zmq::sockopt::rcvhwm, 100);
         sub_socket_.set(zmq::sockopt::subscribe, "");
@@ -49,18 +53,31 @@ protected:
 
         // Connect subscriber
         std::string sub_addr = "tcp://localhost:" + std::to_string(config_["subscribe_port"].get<int>());
-        sub_socket_.connect(sub_addr);
-        std::cout << "[Resizer] Connected to publisher at " << sub_addr << std::endl;
+        try {
+            sub_socket_.connect(sub_addr);
+            LOG_INFO(service_name_, "Connected to publisher at " + sub_addr);
+        } catch (const std::exception& e) {
+            LOG_ERROR(service_name_, "Failed to connect to publisher at " + sub_addr + ": " + e.what());
+            throw;
+        }
 
         // Bind publisher
         std::string pub_addr = "tcp://*:" + std::to_string(config_["publish_port"].get<int>());
-        pub_socket_.bind(pub_addr);
-        std::cout << "[Resizer] Publishing on " << pub_addr << std::endl;
+        try {
+            pub_socket_.bind(pub_addr);
+            LOG_INFO(service_name_, "Publishing on " + pub_addr);
+        } catch (const std::exception& e) {
+            LOG_ERROR(service_name_, "Failed to bind publisher to " + pub_addr + ": " + e.what());
+            throw;
+        }
 
         // Cache config values
         output_width_ = config_["output_width"];
         output_height_ = config_["output_height"];
         jpeg_quality_ = config_["jpeg_quality"];
+
+        LOG_INFO(service_name_, "Configuration loaded - Output: " + std::to_string(output_width_) +
+                 "x" + std::to_string(output_height_) + ", JPEG Quality: " + std::to_string(jpeg_quality_));
 
         // Update initial metrics
         auto& metrics = metrics_mgr_->metrics();
@@ -68,6 +85,8 @@ protected:
         metrics.output_height = output_height_;
         metrics.service_healthy = true;
         metrics_mgr_->commit();
+
+        LOG_DEBUG(service_name_, "Initial metrics updated");
     }
 
     bool processFrame() override {
@@ -81,12 +100,14 @@ protected:
         // Check if there's more (frame data)
         if (!meta_msg.more()) {
             frames_dropped_++;
+            LOG_WARN(service_name_, "Received metadata without frame data, dropping frame");
             return true;
         }
 
         // Receive frame data
         if (!sub_socket_.recv(frame_msg, zmq::recv_flags::none)) {
             frames_dropped_++;
+            LOG_WARN(service_name_, "Failed to receive frame data, dropping frame");
             return true;
         }
 
@@ -94,7 +115,14 @@ protected:
 
         // Parse metadata
         std::string meta_str(static_cast<char*>(meta_msg.data()), meta_msg.size());
-        json metadata = json::parse(meta_str);
+        json metadata;
+        try {
+            metadata = json::parse(meta_str);
+        } catch (const std::exception& e) {
+            frames_dropped_++;
+            LOG_ERROR(service_name_, "Failed to parse metadata JSON: " + std::string(e.what()));
+            return true;
+        }
 
         // Update tracking timestamp
         double resize_time = duration<double>(proc_start.time_since_epoch()).count();
@@ -116,6 +144,10 @@ protected:
 
             // Add current timestamp for next service
             tracking["resize_ts"] = current_time;  // In seconds
+
+            LOG_TRACE(service_name_, "Frame tracking updated - publish_latency: " +
+                      std::to_string(publish_latency_ms) + "ms, resize_latency: " +
+                      std::to_string(resize_latency_ms) + "ms");
         }
 
         // Decode frame
@@ -127,6 +159,7 @@ protected:
         cv::Mat frame = cv::imdecode(buffer, cv::IMREAD_COLOR);
         if (frame.empty()) {
             frames_dropped_++;
+            LOG_ERROR(service_name_, "Failed to decode frame image");
             return true;
         }
 
@@ -135,15 +168,35 @@ protected:
         metrics.input_width = frame.cols;
         metrics.input_height = frame.rows;
 
+        LOG_TRACE(service_name_, "Processing frame - Input: " + std::to_string(frame.cols) +
+                  "x" + std::to_string(frame.rows) + " -> Output: " +
+                  std::to_string(output_width_) + "x" + std::to_string(output_height_));
+
         // Resize frame
         cv::Mat resized;
         cv::Size output_size(output_width_, output_height_);
-        cv::resize(frame, resized, output_size, 0, 0, cv::INTER_LINEAR);
+        try {
+            cv::resize(frame, resized, output_size, 0, 0, cv::INTER_LINEAR);
+        } catch (const std::exception& e) {
+            frames_dropped_++;
+            LOG_ERROR(service_name_, "Failed to resize frame: " + std::string(e.what()));
+            return true;
+        }
 
         // Encode resized frame
         std::vector<int> jpeg_params = {cv::IMWRITE_JPEG_QUALITY, jpeg_quality_};
         std::vector<uchar> encoded;
-        cv::imencode(".jpg", resized, encoded, jpeg_params);
+        try {
+            if (!cv::imencode(".jpg", resized, encoded, jpeg_params)) {
+                frames_dropped_++;
+                LOG_ERROR(service_name_, "Failed to encode resized frame as JPEG");
+                return true;
+            }
+        } catch (const std::exception& e) {
+            frames_dropped_++;
+            LOG_ERROR(service_name_, "Exception during JPEG encoding: " + std::string(e.what()));
+            return true;
+        }
 
         // Calculate processing time
         auto proc_end = steady_clock::now();
@@ -158,12 +211,24 @@ protected:
         // Send resized frame (metadata + data)
         std::string new_meta_str = metadata.dump();
         zmq::message_t new_meta_msg(new_meta_str.data(), new_meta_str.size());
-        pub_socket_.send(new_meta_msg, zmq::send_flags::sndmore);
 
-        zmq::message_t new_frame_msg(encoded.data(), encoded.size());
-        pub_socket_.send(new_frame_msg, zmq::send_flags::none);
+        try {
+            pub_socket_.send(new_meta_msg, zmq::send_flags::sndmore);
+            zmq::message_t new_frame_msg(encoded.data(), encoded.size());
+            pub_socket_.send(new_frame_msg, zmq::send_flags::none);
+        } catch (const std::exception& e) {
+            frames_dropped_++;
+            LOG_ERROR(service_name_, "Failed to send resized frame: " + std::string(e.what()));
+            return true;
+        }
 
         frames_processed_++;
+
+        // Log processing stats for sample frames
+        if (frames_processed_ % 100 == 0) {
+            LOG_DEBUG(service_name_, "Processed " + std::to_string(frames_processed_) +
+                      " frames, last processing time: " + std::to_string(last_processing_time_ms_) + "ms");
+        }
 
         // Update metrics
         updateMetrics();
@@ -175,22 +240,28 @@ protected:
         metrics.frames_processed = frames_processed_;
         metrics.frames_dropped = frames_dropped_;
         metrics.processing_time_ms = last_processing_time_ms_;
-        // Input/output dimensions are updated in processFrame()
+
+        // Log metrics update for debugging
+        if (frames_processed_ % 1000 == 0) {
+            LOG_TRACE(service_name_, "Metrics updated - processed: " + std::to_string(frames_processed_) +
+                      ", dropped: " + std::to_string(frames_dropped_) +
+                      ", processing_time: " + std::to_string(last_processing_time_ms_) + "ms");
+        }
     }
 };
 
 int main() {
-    std::cout << "[Resizer] Frame Resizer starting..." << std::endl;
-    std::cout << "[Resizer] PID: " << getpid() << std::endl;
+    LOG_INFO("frame-resizer", "Frame Resizer starting...");
+    LOG_INFO("frame-resizer", "PID: " + std::to_string(getpid()));
 
     try {
         FrameResizer resizer;
         resizer.run();
     } catch (const std::exception& e) {
-        std::cerr << "[Resizer] Fatal error: " << e.what() << std::endl;
+        LOG_FATAL("frame-resizer", "Fatal error: " + std::string(e.what()));
         return 1;
     }
 
-    std::cout << "[Resizer] Shutdown complete" << std::endl;
+    LOG_INFO("frame-resizer", "Shutdown complete");
     return 0;
 }

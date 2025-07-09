@@ -8,7 +8,6 @@
 #include <atomic>
 #include <memory>
 #include <fstream>
-#include <iostream>
 #include <mutex>
 #include <csignal>
 #include <functional>
@@ -77,6 +76,9 @@ public:
         last_fps_update_ = start_time_;
         last_watchdog_ = start_time_;
 
+        // Initialize logger for this service
+        initializeLogger();
+
         // Setup signal handlers
         setupSignalHandlers();
 
@@ -88,6 +90,25 @@ public:
         if (export_thread_.joinable()) {
             export_thread_.join();
         }
+    }
+
+    // Initialize logger with service-specific configuration
+    void initializeLogger() {
+        auto& logger = Logger::getInstance();
+
+        // Set logger configuration
+        logger.setLevel(Logger::LogLevel::INFO);
+        logger.setOutputMode(Logger::OutputMode::ALL);
+        logger.setSyslogIdent(service_name_);
+
+        // Set log file path
+        std::string log_file = "/var/log/jvideo/" + service_name_ + ".log";
+        if (logger.setLogFile(log_file)) {
+            logger.setMaxFileSize(50 * 1024 * 1024); // 50MB
+            logger.setMaxRotatedFiles(5);
+        }
+
+        LOG_INFO(service_name_, "Logger initialized for service");
     }
 
     // This MUST be called after construction
@@ -105,7 +126,7 @@ public:
         // Initialize here, after object is fully constructed
         initialize();
 
-        std::cout << "[" << service_name_ << "] Starting processing..." << std::endl;
+        LOG_INFO(service_name_, "Starting processing...");
 
         onStart();
 
@@ -120,7 +141,7 @@ public:
                 sendWatchdogNotification();
 
             } catch (const std::exception& e) {
-                std::cerr << "[" << service_name_ << "] Error: " << e.what() << std::endl;
+                LOG_ERROR(service_name_, std::string("Processing error: ") + e.what());
                 errors_++;
                 updateErrorMetrics();
             }
@@ -133,9 +154,11 @@ public:
         finalizeMetrics();
 
         auto total_time = duration<double>(steady_clock::now() - start_time_).count();
-        std::cout << "[" << service_name_ << "] Finished. Processed " << frames_processed_
-                  << " frames in " << std::fixed << std::setprecision(1)
-                  << total_time << " seconds" << std::endl;
+        std::ostringstream summary;
+        summary << "Finished. Processed " << frames_processed_
+                << " frames in " << std::fixed << std::setprecision(1)
+                << total_time << " seconds";
+        LOG_INFO(service_name_, summary.str());
     }
 
     void stop() {
@@ -156,8 +179,10 @@ protected:
                 watchdog_interval_ = std::chrono::duration_cast<seconds>(
                     microseconds(usec / 2)
                 );
-                std::cout << "[" << service_name_ << "] Systemd watchdog enabled with interval: "
-                          << watchdog_interval_.count() << "s" << std::endl;
+                std::ostringstream msg;
+                msg << "Systemd watchdog enabled with interval: "
+                    << watchdog_interval_.count() << "s";
+                LOG_INFO(service_name_, msg.str());
             }
         }
 #else
@@ -173,6 +198,7 @@ protected:
         if (duration_cast<seconds>(now - last_watchdog_) >= watchdog_interval_) {
 #if HAS_SYSTEMD
             sd_notify(0, "WATCHDOG=1");
+            LOG_TRACE(service_name_, "Sent watchdog notification");
 #endif
             last_watchdog_ = now;
         }
@@ -181,13 +207,14 @@ protected:
     void notifySystemdReady() {
 #if HAS_SYSTEMD
         sd_notify(0, "READY=1");
-        std::cout << "[" << service_name_ << "] Notified systemd: READY" << std::endl;
+        LOG_INFO(service_name_, "Notified systemd: READY");
 #endif
     }
 
     void notifySystemdStopping() {
 #if HAS_SYSTEMD
         sd_notify(0, "STOPPING=1");
+        LOG_INFO(service_name_, "Notified systemd: STOPPING");
 #endif
     }
 
@@ -211,21 +238,39 @@ protected:
                 json user_config;
                 config_file >> user_config;
                 config_.merge_patch(user_config);
-                std::cout << "[" << service_name_ << "] Loaded config from " << config_path_ << std::endl;
+                LOG_INFO(service_name_, "Loaded config from " + config_path_);
             } catch (const std::exception& e) {
-                std::cerr << "[" << service_name_ << "] Config parse error: " << e.what()
-                          << ", using defaults" << std::endl;
+                std::string error_msg = "Config parse error: ";
+                error_msg += e.what();
+                error_msg += ", using defaults";
+                LOG_WARN(service_name_, error_msg);
             }
         }
 
         // Extract common settings
         db_path_ = config_.value("benchmark_db_path", getDefaultDbPath());
         export_interval_ = config_.value("benchmark_export_interval", 1000);
+
+        // Apply logger settings from config if present
+        if (config_.contains("log_level")) {
+            std::string level_str = config_["log_level"];
+            Logger::LogLevel level = Logger::LogLevel::INFO;
+
+            if (level_str == "TRACE") level = Logger::LogLevel::TRACE;
+            else if (level_str == "DEBUG") level = Logger::LogLevel::DEBUG;
+            else if (level_str == "INFO") level = Logger::LogLevel::INFO;
+            else if (level_str == "WARN") level = Logger::LogLevel::WARN;
+            else if (level_str == "ERROR") level = Logger::LogLevel::ERROR;
+            else if (level_str == "FATAL") level = Logger::LogLevel::FATAL;
+
+            Logger::getInstance().setLevel(level);
+        }
     }
 
     virtual json getDefaultConfig() const {
         return {
-            {"benchmark_export_interval", 1000}
+            {"benchmark_export_interval", 1000},
+            {"log_level", "INFO"}
         };
     }
 
@@ -235,7 +280,7 @@ protected:
 
     void initializeMetrics() {
         metrics_mgr_ = std::make_unique<MetricsManagerType>(service_name_);
-        std::cout << "[" << service_name_ << "] Initialized metrics manager" << std::endl;
+        LOG_INFO(service_name_, "Initialized metrics manager");
     }
 
     void initializeDatabase() {
@@ -256,6 +301,8 @@ protected:
         // Force initial export to create file
         createDirectoryPath(db_path_);
         asyncExportDatabase();
+
+        LOG_INFO(service_name_, "Database initialized: " + db_path_);
     }
 
     void executeSQL(const std::string& sql) {
@@ -285,9 +332,11 @@ protected:
             storeBenchmark();
             asyncExportDatabase();
 
-            std::cout << "[" << service_name_ << "] Processed " << frames_processed_
-                      << " frames, FPS: " << std::fixed << std::setprecision(1)
-                      << metrics.current_fps << std::endl;
+            std::ostringstream status;
+            status << "Processed " << frames_processed_
+                   << " frames, FPS: " << std::fixed << std::setprecision(1)
+                   << metrics.current_fps;
+            LOG_INFO(service_name_, status.str());
         }
     }
 
@@ -313,7 +362,7 @@ protected:
         sqlite3_stmt* stmt;
 
         if (sqlite3_prepare_v2(db_.get(), sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-            std::cerr << "[" << service_name_ << "] Failed to prepare benchmark statement" << std::endl;
+            LOG_ERROR(service_name_, "Failed to prepare benchmark statement");
             return;
         }
 
@@ -344,7 +393,7 @@ protected:
 
                 sqlite3* file_db;
                 if (sqlite3_open(db_path_.c_str(), &file_db) != SQLITE_OK) {
-                    std::cerr << "[" << service_name_ << "] Failed to open DB: " << db_path_ << std::endl;
+                    LOG_ERROR(service_name_, "Failed to open DB: " + db_path_);
                     export_in_progress_ = false;
                     return;
                 }
@@ -362,8 +411,11 @@ protected:
                 }
 
                 sqlite3_close(file_db);
+                LOG_TRACE(service_name_, "Database exported successfully");
             } catch (const std::exception& e) {
-                std::cerr << "[" << service_name_ << "] Export failed: " << e.what() << std::endl;
+                std::string error_msg = "Export failed: ";
+                error_msg += e.what();
+                LOG_ERROR(service_name_, error_msg);
             }
             export_in_progress_ = false;
         });
@@ -394,7 +446,13 @@ protected:
 
     // Signal handling
     static void signalHandler(int sig) {
-        std::cout << "\nReceived signal " << sig << ", shutting down..." << std::endl;
+        std::ostringstream msg;
+        msg << "Received signal " << sig << ", shutting down...";
+
+        // Get any instance to log through - signal handlers are static
+        // This is safe because the logger is a singleton
+        LOG_INFO("SignalHandler", msg.str());
+
         global_running_ = false;
     }
 
